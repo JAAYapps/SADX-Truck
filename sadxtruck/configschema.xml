@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<ConfigSchema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns="http://www.sonicretro.org">
+	<Groups>
+		<Group name="Damage" display="Damage">
+			<Property name="KeepDents" display="Keep dents per truck" type="bool" defaultvalue="True">
+				<HelpText>Each truck keeps its dents and cracked windows when you switch to another truck and back, until the game closes (like part damage). Off: switching trucks straightens the old one.</HelpText>
+			</Property>
+			<Property name="DentStrength" display="Dent strength (x)" type="int" defaultvalue="1" minvalue="1" maxvalue="10">
+				<HelpText>How deep each hit dents the body. 1 = Cabela's own numbers (a 12-25 mph hit dents about 0.6 inch). 4 = about 2.5 inches. 10 = about 6 inches, the most a dent can go.</HelpText>
+			</Property>
+			<Property name="SaveDamage" display="Save damage between games" type="bool" defaultvalue="True">
+				<HelpText>Each truck's part damage, dents, cracked windows, fuel and odometer are saved to damage_Car1.bin to damage_Car14.bin in this mod's folder, and come back next time you play. Saved when Sonic gets out, on a truck switch, on a repair and when the game closes. Dents also need "Keep dents per truck". Delete a file (or repair the truck) to start that truck fresh.</HelpText>
+			</Property>
+			<Property name="LandingStrength" display="Landing damage (x)" type="int" defaultvalue="1" minvalue="1" maxvalue="50">
+				<HelpText>How much a hard landing (over 1 second in the air) hurts each part. 1 = Cabela's own numbers (a 1.2 s jump landing at 34 mph takes 6 points off each part). 10 = 60 points. 50 = 300 points, about the old mod's guess. Landings under 25 mph do no part damage at any setting, as in Cabela's. Dents from landings use Dent strength.</HelpText>
+			</Property>
+		</Group>
+		<Group name="Driving" display="Driving">
+			<Property name="UseFuel" display="Use fuel" type="bool" defaultvalue="True">
+				<HelpText>On: the truck burns fuel like in Cabela's (a full tank lasts 15 to 40 minutes at 3000 RPM, depending on the truck and 2x4 / 4x4 / 4x4 Low). When it runs dry the engine stops; get out and hold D-pad up 2 seconds to repair and fill the tank. Off: no fuel is used, the tank never runs dry and the fuel gauge is hidden.</HelpText>
+			</Property>
+		</Group>
+		<Group name="Sound" display="Sound">
+			<Property name="TruckVolume" display="Truck volume" type="int" defaultvalue="100" minvalue="0" maxvalue="100">
+				<HelpText>Volume of all the truck's sounds (engine, starter, horn, water, damage), 0 to 100. It is also multiplied by the Mod Manager's sound effect volume (Game Config, Sound, SEVolume), and the truck is silent when the game's sound is turned off there.</HelpText>
+			</Property>
+		</Group>
+	</Groups>
+</ConfigSchema>

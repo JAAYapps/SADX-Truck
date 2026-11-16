@@ -1,0 +1,12 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle@4
+WriteFile@20
+LoadLibraryExA@12
+GetProcAddress@8
+GetFullPathNameA@16
+GetLastError@0
+VirtualAlloc@16
+VirtualProtect@16
+AddVectoredExceptionHandler@8
+ExitProcess@4

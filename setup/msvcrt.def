@@ -1,0 +1,26 @@
+LIBRARY msvcrt.dll
+EXPORTS
+fopen
+fread
+fwrite
+fclose
+fseek
+ftell
+malloc
+free
+printf
+sprintf
+memcpy
+memset
+memcmp
+strlen
+_stricmp
+strrchr
+realloc
+strcmp
+_mkdir
+sin
+cos
+floor
+ceil
+_vsnprintf

@@ -1,0 +1,9 @@
+bin/
+*.obj
+*.exe
+*.dll
+prefix/
+*.bsp
+last_run.txt
+debug.log
+trucks.bin
