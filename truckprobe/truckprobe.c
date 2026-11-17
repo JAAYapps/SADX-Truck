@@ -41,7 +41,11 @@ int _fltused = 1;
 // EngineDll SetTractionType).  Proposal: 1.
 #define TRACTION_MODE 1
 
-#define CORA3_DATA "Z:\\run\\media\\joshua\\e8ca722b-1e81-4c5c-a8e5-3576f9c1c256\\Games\\cabelas-4x4-offroad-adventure-3\\drive_c\\Program Files (x86)\\Activision Value\\FUNLabs\\Cora3\\Cora3\\"
+// Cabela's own install folder; for another place build with
+// -DCORA3_DATA="\"D:\\\\Games\\\\Cora3\\\\Cora3\\\\\"" (ends with a backslash).
+#ifndef CORA3_DATA
+#define CORA3_DATA "C:\\Program Files (x86)\\Activision Value\\FUNLabs\\Cora3\\Cora3\\"
+#endif
 
 // Which truck: 0 = Car1 (Predator), 1 = Car12 (Stalker, the fresh-save truck).
 #define CAR_STALKER 1
