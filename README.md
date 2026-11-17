@@ -23,7 +23,8 @@ pack's installer (it is a 16-bit program and will not start on 64-bit Windows);
 
 ## Install
 
-1. Put the mod in SADX's `mods` folder, so you have `mods\SADX Truck\` with
+1. Download `SADX-Truck.zip` from the [Releases page](https://github.com/JAAYapps/SADX-Truck/releases)
+   and unzip it into SADX's `mods` folder, so you have `mods\SADX Truck\` with
    `sadxtruck.dll`, `mod.ini`, `configschema.xml` and `setup.exe` in it.
 2. Put `cora3_enhancement_pack.zip` in that same folder (or anywhere; setup will ask for it).
 3. Double-click `setup.exe`. It looks for Cabela's 3 and Cabela's 1 in Program Files and asks
