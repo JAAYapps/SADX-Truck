@@ -118,5 +118,10 @@ lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console sadxtruck/testho
 | `heightmap_to_obj.py`, `colormap_to_png.py` | turn a Cabela's map into a 3D model and a picture |
 | `truckprobe/truckprobe.c` | the first experiment: loads Cabela's engine on its own and drives one truck |
 
+## License
+
+The mod's code is under the MIT License (see `LICENSE`). That covers only this repository's
+own code; Cabela's files that `setup.exe` reads or writes on your PC stay under their owners' terms.
+
 Cabela's 4x4 Off-Road Adventure is a trademark of its owners. Sonic Adventure DX is a trademark of SEGA.
 This is a fan mod and is not affiliated with either.
