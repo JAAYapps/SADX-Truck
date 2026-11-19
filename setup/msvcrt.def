@@ -24,3 +24,5 @@ cos
 floor
 ceil
 _vsnprintf
+remove
+qsort

@@ -255,6 +255,8 @@ static u32 dll_base;
 static void *manager, *truck;
 static int frame;
 static int riding;                       // 1 = Sonic is in the truck
+static int map_menu;                     // 1 = the map menu is open (Station Square, on foot)
+static void map_menu_picture(void);
 // Snorkel fitted on each truck: 0 none, 1 Watermaster (Snork1), 2
 // Watermaster Ultra (Snork2).  Kept between rides; D-pad down on foot.
 static int snorkel[TRUCKS];
@@ -1628,6 +1630,7 @@ static void __cdecl rings_draw(char *tp)
 {
     m4x4 tm[5];
     (void)tp;
+    if (map_menu) map_menu_picture();
     if (!frame && !picture_frames) return;
     check_textures();
     if (picture_frames) {
@@ -1786,12 +1789,14 @@ static int spawn(void)
     return 1;
 }
 
+#ifndef TEST_EXE
+static void map_init(const char *path, u32 n, const void *helpers);
+#endif
 __declspec(dllexport) void __cdecl Init(const char *path, const void *helpers)
 {
     char name[400], full[400];
     u32 n = 0;
     const char *file = "\\EngineDll.dll";
-    (void)helpers;
 
     while (path[n] && n < 300) { name[n] = path[n]; n++; }
     for (u32 k = 0; k < n; k++) snd_dir[k] = path[k];
@@ -1840,6 +1845,9 @@ __declspec(dllexport) void __cdecl Init(const char *path, const void *helpers)
     // No trucks.bin: the mod stays off (truck stays 0, so every hook
     // returns early) and SADX plays as normal.
     if (!trucks_bin_load(path, n)) return;
+#ifndef TEST_EXE
+    map_init(path, n, helpers);         // Cabela's maps, further down
+#endif
     damage_files_init(path, n);
     sound_settings(path, n);
     free_cam_patch();
@@ -4185,7 +4193,7 @@ static int sadx_walking(const char *task)
 __declspec(dllexport) void __cdecl OnControl(void)
 {
     static u32 start_before;
-    if (!riding || pad_freed || !pad_raw || game_mode != 15) { start_before = 0; return; }
+    if ((!riding && !map_menu) || pad_freed || !pad_raw || game_mode != 15) { start_before = 0; return; }
     u32 start = *(const u32 *)(pad_raw + 8) & BUTTON_START;
     for (int k = 8; k < 36; k++) pad_game[k] = 0;
     *(u32 *)(pad_game + 8) = start;                         // on
@@ -4194,6 +4202,1706 @@ __declspec(dllexport) void __cdecl OnControl(void)
     *(u32 *)(pad_game + 20) = start_before & ~start;        // release
     start_before = start;
 }
+
+// Cabela's maps, step 3: Death Valley as level 11.  maps\bj_a.bin (written by
+// map_to_bin.py; layout there): Cabela's ground at every other grid point,
+// 16 x 16 blocks of 33 x 33 points, SADX units, already mirrored like the
+// trucks.  Texture pack SXMAP_BJ_A: Cabela's 16 color map pictures.
+//
+// On foot in Station Square, L + R held 2 seconds goes to level 11, whose
+// landtable is the map's own (see map_patch); there, again goes back.
+// The map's pieces are solid (1 << 0) but not drawn by SADX (no
+// (1 << 31)): SADX's usual draw path skips models without the vertex
+// buffer it builds for its own (see make_truck_models), so the mod draws
+// them itself with njDrawModel_Dynamic, from a task like the rings.
+// The map sits MAP_OFF_X / MAP_OFF_Z away from the middle (from step 2,
+// when it shared Station Square; kept, harmless).
+#ifndef TEST_EXE
+#define MAP_NB 16
+#define MAP_NP 33
+#define MAP_CELLS 32
+#define MAP_BLOCKS (MAP_NB * MAP_NB)
+#define MAP_PTS (MAP_NP * MAP_NP)
+#define MAP_CORNERS (MAP_CELLS * MAP_CELLS * 6)
+#define MAP_BLOCK_BYTES (20 + MAP_PTS * 24)
+#define MAP_OFF_X 60000.0f
+#define MAP_OFF_Z 60000.0f
+#define MAP_DRAW 4000.0f                 // draw blocks within 400 m (about 1/4 mile) of the camera
+#define MAP_NEAR 2000.0f                 // full detail within 200 m (about 650 feet), beyond that 1/16
+#define MAP_FAR_STEP 4                   // far blocks: every 4th point, 8 x 8 cells
+#define MAP_FAR_CELLS (MAP_CELLS / MAP_FAR_STEP)
+#define MAP_FAR_CORNERS (MAP_FAR_CELLS * MAP_FAR_CELLS * 6)
+static unsigned char *map_file;          // maps\<map>.bin of the map picked last
+static nj_texname map_texnames[17];     // the 16 color map pictures, then the detail texture
+static struct { nj_texname *textures; u32 n; } map_texlist = { map_texnames, 16 };
+static u32 map_gbix0, map_det_gbix;
+static char map_pack[17];
+static nj_material map_mats[16];
+static short map_tris[MAP_CORNERS];
+static short map_uv[16][MAP_CORNERS][2]; // by the block's place inside its picture (4 x 4)
+static nj_meshset map_sets[MAP_BLOCKS];
+static nj_model map_models[MAP_BLOCKS];
+static nj_object map_objs[MAP_BLOCKS];
+static short map_far_tris[MAP_FAR_CORNERS];         // far blocks: same points, fewer triangles
+static short map_far_uv[16][MAP_FAR_CORNERS][2];
+static nj_meshset map_far_sets[MAP_BLOCKS];
+static nj_model map_far_models[MAP_BLOCKS];
+// Ground detail (Cabela's SHADER_DETAILOP stage, see map_to_bin.py): near
+// blocks drawn a second time, same points, the detail texture repeated
+// MAP_DET_REPEAT times across a block, blended as 2 x ground x detail
+// (mid-gray changes nothing).  Unlit, so the light isn't counted twice.
+// SADX turns a Ninja blend value into Direct3D's through one table of 8
+// for both source and destination (0x88AE1C, 9,481,756, read at 0x7849C0:
+// 0 ZERO, 1 ONE, 2 SRCCOLOR, 3 INVSRCCOLOR, 4 SRCALPHA, 5 INVSRCALPHA,
+// 6 DESTALPHA, 7 INVDESTALPHA), so DESTCOLOR can't be asked for (Ninja
+// "other color" became SRCCOLOR for the source: tested, far too bright).
+// While the detail pass draws, entries 2 and 3 are DESTCOLOR (9) and
+// SRCCOLOR (3); the material asks src 2, dst 3: detail x ground + ground x
+// detail.  SADX's values (3 and 4) go back right after.  The table is in
+// sonic.exe's read-only part: made writable once (map_det_table_ok).
+#define MAP_DET_REPEAT 8
+static short map_det_uv[MAP_CORNERS][2];
+static nj_material map_det_mat;
+static nj_meshset map_det_sets[MAP_BLOCKS];
+static nj_model map_det_models[MAP_BLOCKS];
+#define NJ_BLEND_TABLE ((u32 *)0x88AE1C)
+static int map_det_table_ok;             // 1 = writable, -1 = VirtualProtect failed (no detail)
+typedef struct { float c[3], r, wy, wz; void *obj; int blockbits, flags; } map_col;
+static map_col map_cols_base[MAP_BLOCKS + 4];  // ground blocks, then the 4 walls
+static map_col *map_cols = map_cols_base;       // that, or a longer copy with the rocks' shapes after it
+// Invisible walls along the map's 4 edges (collision only): a flat
+// upright rectangle each, 2 triangles, facing in.
+static float map_wall_pts[4][4][3], map_wall_nrm[4][4][3];
+static short map_wall_tris[4][6];
+static float map_edge[4];                // xlo, xhi, zlo, zhi: where the walls stand
+static nj_meshset map_wall_sets[4];
+static nj_model map_wall_models[4];
+static nj_object map_wall_objs[4];
+static struct { short ncol, nanim, attrs, loadflags; float clip; void *col, *anim; const char *texname; void *texlist; int bin, loadfunc; } map_lt;
+static float map_spawn[3];
+static float map_low, map_high;          // the map's lowest and highest ground (SADX units)
+#define MAP_LEVEL 11                     // LevelIDs_B, unused by SADX; see map_patch
+static int map_on, map_tex_tried, map_patched;
+static char *map_task;
+
+static void map_patch(void);
+// Drawing the way SADX draws its own levels.  njDrawModel_Dynamic moves
+// every point on the CPU every frame (about 0.07 microseconds a triangle,
+// 8 ms for the ground in hilly spots).  SADX's levels instead get a vertex
+// buffer per meshset once, at level load: InitLandTable (0x43A260) runs
+// InitLandTableObject (0x787140) on each visible piece, which runs
+// InitLandTableMeshSet (0x787010; names from SADXFunctions.h) on each
+// meshset whose buffer (meshset byte 24) is 0: MeshSetBuffer_Allocate
+// (0x794840, the game's heap, linked into a list at 0x38A5E50) and a fill
+// function picked by mesh kind, texture coordinates and normals (table
+// 0x389D790).  njDrawModel_SADX (0x77EDA0) then draws from the buffers.
+// The map does the same, each meshset the first time it is drawn; before
+// a map's memory is freed, MeshSetBuffer_Free (0x7948C0, thiscall: unlinks,
+// frees, sets byte 24 back to 0) for each, or the list would point at
+// freed memory.
+#define InitLandTableMeshSet ((void (__cdecl *)(void *, void *))0x787010)
+#define njDrawModel_SADX ((void (__cdecl *)(void *))0x77EDA0)
+#define Direct3D_EnableZWrite ((void (__cdecl *)(u32))0x77ED20)   // SADXFunctions.h
+#define MeshSetBuffer_Free ((void (__thiscall *)(void *))0x7948C0)
+static int nj_buffers_made;
+static void draw_buffered(nj_model *md)
+{
+    for (int i = 0; i < md->nsets; i++)
+        if (!md->sets[i].buffer) { InitLandTableMeshSet(md, &md->sets[i]); nj_buffers_made++; }
+    njDrawModel_SADX(md);
+}
+static void buffers_free(nj_meshset *st, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (st[i].buffer) { MeshSetBuffer_Free(&st[i]); nj_buffers_made--; }
+        st[i].buffer = 0;
+    }
+}
+// The 4 walls, from the outer points of the edge blocks: block row 0 is the
+// map's low-z edge, row 15 the high-z edge; column 0 is high x (x is
+// flipped, see map_to_bin.py), column 15 low x.  From 200 units (about 65
+// feet) below the lowest ground to 1000 units (about 330 feet) above the
+// highest.  Triangles wound so (b - a) x (c - a) points into the map.
+static void map_walls(unsigned char *b)
+{
+    float xlo = 0, xhi = 0, zlo = 0, zhi = 0;
+    for (int k2 = 0; k2 < MAP_BLOCKS; k2++) {
+        const float *pts = (const float *)(b + 64 + k2 * MAP_BLOCK_BYTES + 20);
+        for (int p = 0; p < MAP_PTS; p++) {
+            float x = pts[p * 3], z = pts[p * 3 + 2];
+            if ((k2 == 0 && p == 0) || x < xlo) xlo = x;
+            if ((k2 == 0 && p == 0) || x > xhi) xhi = x;
+            if ((k2 == 0 && p == 0) || z < zlo) zlo = z;
+            if ((k2 == 0 && p == 0) || z > zhi) zhi = z;
+        }
+    }
+    map_edge[0] = xlo; map_edge[1] = xhi; map_edge[2] = zlo; map_edge[3] = zhi;
+    float ylo = map_low - 200.0f, yhi = map_high + 1000.0f;
+    // each wall: its two ends along the ground, and the way in
+    const float ends[4][2][2] = { { { xlo, zlo }, { xlo, zhi } }, { { xhi, zlo }, { xhi, zhi } },
+                                 { { xlo, zlo }, { xhi, zlo } }, { { xlo, zhi }, { xhi, zhi } } };
+    const float in[4][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+    for (int w = 0; w < 4; w++) {
+        float (*q)[3] = map_wall_pts[w];
+        for (int e = 0; e < 2; e++) {
+            q[e][0] = ends[w][e][0]; q[e][1] = ylo; q[e][2] = ends[w][e][1];          // bottom
+            q[e + 2][0] = ends[w][e][0]; q[e + 2][1] = yhi; q[e + 2][2] = ends[w][e][1];  // top
+        }
+        for (int k = 0; k < 4; k++) for (int i = 0; i < 3; i++) map_wall_nrm[w][k][i] = in[w][i];
+        // (a, b, c) = (bottom 0, bottom 1, top 0); flip if it faces out
+        float e1[3], e2[3];
+        for (int i = 0; i < 3; i++) { e1[i] = q[1][i] - q[0][i]; e2[i] = q[2][i] - q[0][i]; }
+        float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+        int out = n[0] * in[w][0] + n[1] * in[w][1] + n[2] * in[w][2] < 0;
+        const short fwd[6] = { 0, 1, 2, 1, 3, 2 }, back[6] = { 0, 2, 1, 1, 2, 3 };
+        for (int k = 0; k < 6; k++) map_wall_tris[w][k] = out ? back[k] : fwd[k];
+        float c[3], r2 = 0;
+        for (int i = 0; i < 3; i++) c[i] = (q[0][i] + q[3][i]) / 2;
+        for (int i = 0; i < 3; i++) r2 += (q[3][i] - c[i]) * (q[3][i] - c[i]);
+        float r = sqrt_f(r2);
+        nj_meshset *st = &map_wall_sets[w];
+        st->type_mat = 0; st->n = 2; st->meshes = map_wall_tris[w];
+        nj_model *md = &map_wall_models[w];
+        md->points = q; md->normals = map_wall_nrm[w]; md->npoints = 4;
+        md->sets = st; md->mats = &map_mats[0]; md->nsets = 1; md->nmats = 1;
+        md->center[0] = c[0]; md->center[1] = c[1]; md->center[2] = c[2]; md->r = r;
+        nj_object *o = &map_wall_objs[w];
+        o->eval = (1u << 0) | (1u << 1) | (1u << 2);
+        o->model = md; o->scl[0] = o->scl[1] = o->scl[2] = 1.0f;
+        int k2 = MAP_BLOCKS + w;
+        map_cols[k2].c[0] = c[0]; map_cols[k2].c[1] = c[1]; map_cols[k2].c[2] = c[2]; map_cols[k2].r = r;
+        map_cols[k2].obj = o;
+        map_cols[k2].flags = 1 << 0;                    // solid, not drawn
+    }
+    PrintDebug("[SADX Truck] map: walls at x %.0f and %.0f, z %.0f and %.0f, from y %.0f to %.0f\n",
+               (double)xlo, (double)xhi, (double)zlo, (double)zhi, (double)ylo, (double)yhi);
+}
+// The 16 maps, in Cabela's own order and with its names (SCRIPTS\MAPS.LUA
+// RegisterMaps; the letter is the region: Baja, National forest, Canyon,
+// Swamp, Alaska).  map_to_bin.py uses the same order for texture numbers.
+static const char *const map_ids[16] = { "bj_a", "bj_b", "nf_a", "nf_b", "bj_d", "bj_c", "cn_b", "nf_c",
+                                         "sw_b", "sw_c", "cn_a", "cn_c", "sw_a", "ak_a", "ak_b", "ak_c" };
+static const char *const map_names[16] = { "B. Death Valley", "B. Coyote-Road", "N. National Park", "N. Sequoia Reservation",
+                                           "B. Sun-Oasis", "B. Abandoned Mine", "C. Red Rock", "N. Southern Woods",
+                                           "S. El-Dorado", "S. Devil-Moon", "C. Grand Canyon", "C. Buffalo Cliffs",
+                                           "S. Upper-Swamps", "A. Grizzly Valley", "A. Frozen Cliffs", "A. White Peak" };
+static char map_dir[320];                // the mod folder
+static u32 map_dir_n;
+static const void *map_helpers;
+static int map_have[16];                 // maps\<map>.bin is there
+static int map_now = -1;                 // the map in map_file
+static void map_path(char *name, int k)
+{
+    u32 i = 0;
+    for (; i < map_dir_n; i++) name[i] = map_dir[i];
+    const char *f = "\\maps\\";
+    while (*f) name[i++] = *f++;
+    for (f = map_ids[k]; *f; ) name[i++] = *f++;
+    for (f = ".bin"; *f; ) name[i++] = *f++;
+    name[i] = 0;
+}
+static void obj_free(int (__stdcall *vf)(void *, u32, u32));
+static void gr_free(int (__stdcall *vf)(void *, u32, u32));
+static void bc_free(int (__stdcall *vf)(void *, u32, u32));
+static void sky_free(int (__stdcall *vf)(void *, u32, u32));
+static void sky_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                     int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                     int (__stdcall *cl)(void *));
+static void bc_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                    int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                    int (__stdcall *cl)(void *));
+static void gr_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                    int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                    int (__stdcall *cl)(void *));
+static void obj_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                     int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                     int (__stdcall *cl)(void *));
+// Init: which maps are there, and the level 11 patch.  No map is read yet.
+static void map_init(const char *path, u32 n, const void *helpers)
+{
+    map_dir_n = n < 300 ? n : 300;
+    for (u32 i = 0; i < map_dir_n; i++) map_dir[i] = path[i];
+    map_helpers = helpers;
+    void *kl = LoadLibraryExA("kernel32.dll", 0, 0);
+    u32 (__stdcall *ga)(const char *) = kl ? (void *)GetProcAddress(kl, "GetFileAttributesA") : 0;
+    int count = 0;
+    char name[400];
+    for (int k = 0; k < 16; k++) {
+        map_path(name, k);
+        map_have[k] = ga && ga(name) != 0xFFFFFFFFu;
+        count += map_have[k];
+    }
+    if (!count) { PrintDebug("[SADX Truck] map: no maps in %s\\maps, no map menu\n", map_dir); return; }
+    map_patch();
+    PrintDebug("[SADX Truck] map: %d of 16 maps there; in Station Square on foot hold L + R 2 seconds for the map menu\n", count);
+}
+// Read map k (maps\<map>.bin) and make its models, walls and start point.
+// 1 = done.  The old map's file is freed first.
+static int map_open(int k)
+{
+    char name[400];
+    map_path(name, k);
+    const void *helpers = map_helpers;
+    void *kl = LoadLibraryExA("kernel32.dll", 0, 0);
+    void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *) = kl ? (void *)GetProcAddress(kl, "CreateFileA") : 0;
+    int (__stdcall *rf)(void *, void *, u32, u32 *, void *) = kl ? (void *)GetProcAddress(kl, "ReadFile") : 0;
+    u32 (__stdcall *fs)(void *, u32 *) = kl ? (void *)GetProcAddress(kl, "GetFileSize") : 0;
+    int (__stdcall *cl)(void *) = kl ? (void *)GetProcAddress(kl, "CloseHandle") : 0;
+    int (__stdcall *vf)(void *, u32, u32) = kl ? (void *)GetProcAddress(kl, "VirtualFree") : 0;
+    if (!cf || !rf || !fs || !cl || !vf) return 0;
+    buffers_free(map_sets, MAP_BLOCKS);
+    buffers_free(map_far_sets, MAP_BLOCKS);
+    buffers_free(map_det_sets, MAP_BLOCKS);
+    if (map_file) { vf(map_file, 0, 0x8000); map_file = 0; map_now = -1; }   // MEM_RELEASE
+    gr_free(vf);
+    bc_free(vf);
+    sky_free(vf);
+    obj_free(vf);
+    map_cols = map_cols_base;
+    void *h = cf(name, 0x80000000u, 1, 0, 3, 0, 0);
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] map: %s not found\n", name); return 0; }
+    u32 size = fs(h, 0), got = 0;
+    unsigned char *b = size == 64 + MAP_BLOCKS * MAP_BLOCK_BYTES ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+    int ok = b && rf(h, b, size, &got, 0) && got == size;
+    cl(h);
+    const u32 *hd = (const u32 *)b;
+    if (!ok || hd[0] != 0x504D5853u /* "SXMP" */ || hd[1] != 1 || hd[2] != MAP_NB || hd[3] != MAP_NP || hd[4] != 16) {
+        PrintDebug("[SADX Truck] map: %s is not the shape this sadxtruck.dll reads (%u bytes)\n", name, size);
+        if (b) vf(b, 0, 0x8000);
+        return 0;
+    }
+    map_gbix0 = hd[5];
+    map_det_gbix = hd[14];                               // byte 56: the detail texture's number, 0 = none
+    map_texlist.n = map_det_gbix ? 17 : 16;
+    const float *sp = (const float *)(b + 24);
+    map_spawn[0] = sp[0] + MAP_OFF_X; map_spawn[1] = sp[1]; map_spawn[2] = sp[2] + MAP_OFF_Z;
+    for (int i = 0; i < 16; i++) map_pack[i] = (char)b[40 + i];
+    // One triangle list for every block: (a, b, c) and (b, d, c) per cell.
+    int t = 0;
+    for (int i = 0; i < MAP_CELLS; i++)
+        for (int j = 0; j < MAP_CELLS; j++) {
+            short a = (short)(i * MAP_NP + j), bb = (short)(a + 1), c = (short)(a + MAP_NP), d = (short)(c + 1);
+            const short q[6] = { a, bb, c, bb, d, c };
+            for (int e = 0; e < 6; e++) map_tris[t++] = q[e];
+        }
+    // Far blocks: the same 33 x 33 points, cells of 4 x 4 (1/16 of the triangles).
+    t = 0;
+    for (int i = 0; i < MAP_CELLS; i += MAP_FAR_STEP)
+        for (int j = 0; j < MAP_CELLS; j += MAP_FAR_STEP) {
+            short a = (short)(i * MAP_NP + j), bb = (short)(a + MAP_FAR_STEP),
+                  c = (short)(a + MAP_FAR_STEP * MAP_NP), d = (short)(c + MAP_FAR_STEP);
+            const short q[6] = { a, bb, c, bb, d, c };
+            for (int e = 0; e < 6; e++) map_far_tris[t++] = q[e];
+        }
+    // Texture coordinates per corner (255 = 1.0, the same as the trucks'):
+    // a block is a quarter of its picture each way.
+    for (int p = 0; p < 16; p++) {
+        for (int e = 0; e < MAP_CORNERS; e++) {
+            int pt = map_tris[e], i = pt / MAP_NP, j = pt % MAP_NP;
+            map_uv[p][e][0] = (short)((255 * ((p % 4) * MAP_CELLS + j) + 64) / 128);
+            map_uv[p][e][1] = (short)((255 * ((p / 4) * MAP_CELLS + i) + 64) / 128);
+        }
+        for (int e = 0; e < MAP_FAR_CORNERS; e++) {
+            int pt = map_far_tris[e], i = pt / MAP_NP, j = pt % MAP_NP;
+            map_far_uv[p][e][0] = (short)((255 * ((p % 4) * MAP_CELLS + j) + 64) / 128);
+            map_far_uv[p][e][1] = (short)((255 * ((p / 4) * MAP_CELLS + i) + 64) / 128);
+        }
+    }
+    for (int e = 0; e < MAP_CORNERS; e++) {
+        int pt = map_tris[e], i = pt / MAP_NP, j = pt % MAP_NP;
+        map_det_uv[e][0] = (short)(255 * MAP_DET_REPEAT * j / MAP_CELLS);
+        map_det_uv[e][1] = (short)(255 * MAP_DET_REPEAT * i / MAP_CELLS);
+    }
+    // texture (repeated, not clamped), both sides, use alpha (blending on),
+    // unlit, src = 2 (1 << 30), dst = 3 ((1 << 27) | (1 << 26)): the
+    // table entries swapped in while it draws
+    map_det_mat.diffuse = 0xFFFFFFFFu; map_det_mat.specular = 0; map_det_mat.exponent = 11.0f;
+    map_det_mat.tex = 16;
+    map_det_mat.flags = (1u << 21) | (1u << 23) | (1u << 20) | (1u << 25) | (1u << 30) | (1u << 27) | (1u << 26);
+    // Texture on, both sides, clamped at the picture's edges (no seams from
+    // the next picture's other side), normal blending.
+    for (int m = 0; m < 16; m++) {
+        map_mats[m].diffuse = 0xFFB2B2B2u; map_mats[m].specular = 0; map_mats[m].exponent = 11.0f;
+        map_mats[m].tex = (u32)m;
+        map_mats[m].flags = (1u << 21) | (1u << 23) | (1u << 16) | (1u << 15) | (1u << 31) | (1u << 28) | (1u << 26);
+    }
+    for (int k2 = 0; k2 < MAP_BLOCKS; k2++) {
+        unsigned char *blk = b + 64 + k2 * MAP_BLOCK_BYTES;
+        u32 tex = *(u32 *)blk;
+        float *c = (float *)(blk + 4), *pts = (float *)(blk + 20), *nrm = pts + MAP_PTS * 3;
+        c[0] += MAP_OFF_X; c[2] += MAP_OFF_Z;
+        for (int p = 0; p < MAP_PTS; p++) {
+            pts[p * 3] += MAP_OFF_X; pts[p * 3 + 2] += MAP_OFF_Z;
+            if ((k2 == 0 && p == 0) || pts[p * 3 + 1] < map_low) map_low = pts[p * 3 + 1];
+            if ((k2 == 0 && p == 0) || pts[p * 3 + 1] > map_high) map_high = pts[p * 3 + 1];
+        }
+        int bz = k2 / MAP_NB, bx = k2 % MAP_NB;
+        nj_meshset *s = &map_sets[k2];
+        s->type_mat = 0; s->n = MAP_CELLS * MAP_CELLS * 2; s->meshes = map_tris;
+        s->uv = &map_uv[(bz % 4) * 4 + bx % 4][0][0];
+        nj_model *md = &map_models[k2];
+        md->points = pts; md->normals = nrm; md->npoints = MAP_PTS;
+        md->sets = s; md->mats = &map_mats[tex < 16 ? tex : 0]; md->nsets = 1; md->nmats = 1;
+        md->center[0] = c[0]; md->center[1] = c[1]; md->center[2] = c[2]; md->r = c[3];
+        nj_meshset *fs2 = &map_far_sets[k2];
+        *fs2 = *s; fs2->n = MAP_FAR_CELLS * MAP_FAR_CELLS * 2; fs2->meshes = map_far_tris;
+        fs2->uv = &map_far_uv[(bz % 4) * 4 + bx % 4][0][0];
+        map_far_models[k2] = *md; map_far_models[k2].sets = fs2;  // drawn only, never collided with
+        nj_meshset *ds = &map_det_sets[k2];
+        *ds = *s; ds->uv = &map_det_uv[0][0]; ds->buffer = 0;
+        map_det_models[k2] = *md; map_det_models[k2].sets = ds; map_det_models[k2].mats = &map_det_mat;
+        nj_object *o = &map_objs[k2];
+        o->eval = (1u << 0) | (1u << 1) | (1u << 2);   // don't move, turn or scale
+        o->model = md; o->scl[0] = o->scl[1] = o->scl[2] = 1.0f;
+        map_cols[k2].c[0] = c[0]; map_cols[k2].c[1] = c[1]; map_cols[k2].c[2] = c[2]; map_cols[k2].r = c[3];
+        map_cols[k2].obj = o;
+        map_cols[k2].flags = 1 << 0;                    // solid, not drawn by SADX
+    }
+    map_walls(b);
+    map_lt.ncol = MAP_BLOCKS + 4; map_lt.col = map_cols;
+    map_lt.clip = MAP_DRAW; map_lt.texlist = &map_texlist;
+    // Sonic's (and every character's) start in level 11 act 0, through the
+    // Mod Loader (HelperFunctions: Version, then RegisterStartPosition).
+    {
+        static struct { short level, act; float pos[3]; int yrot; } st;
+        st.level = MAP_LEVEL; st.act = 0;
+        st.pos[0] = map_spawn[0]; st.pos[1] = map_spawn[1] + 10.0f; st.pos[2] = map_spawn[2];
+        st.yrot = 0;
+        void (__cdecl *reg)(unsigned char, const void *) = helpers ? *(void **)((const char *)helpers + 4) : 0;
+        if (reg) for (int c = 0; c < 8; c++) reg((unsigned char)c, &st);
+    }
+    map_file = b;
+    map_now = k;
+    obj_load(k, cf, rf, fs, cl);
+    bc_load(k, cf, rf, fs, cl);
+    sky_load(k, cf, rf, fs, cl);
+    gr_load(k, cf, rf, fs, cl);
+    PrintDebug("[SADX Truck] map: %s (%s) read, start at %.0f %.0f %.0f\n", map_names[k], name,
+               (double)map_spawn[0], (double)map_spawn[1], (double)map_spawn[2]);
+    return 1;
+}
+
+// ---- Rocks and plants (step 5a) ----------------------------------------
+// maps\<map>_obj.bin from map_to_bin.py (its comment has the layout):
+// Cabela's rock and plant models and where each copy stands.  Drawn by
+// map_draw: each copy within reach (bushes, which have no collision shape,
+// within OBJ_NEAR; the rest within OBJ_FAR) with its own matrix
+// (nj_apply).  Collision: each copy of a model with a collision shape gets
+// that shape moved into place once at load (world points, so no turn
+// order to agree on with SADX) and its own landtable piece after the
+// ground blocks and walls, solid like them.
+#define OBJ_NEAR 1000.0f                 // bushes: drawn within 100 m (about 330 feet)
+#define OBJ_FAR MAP_DRAW                 // rocks, cactus, trees: as far as the ground (400 m, about 1/4 mile)
+#define OBJ_TEX_MAX 32
+typedef struct { int first, n, flags; float rad; } obj_model;
+typedef struct { float m[16]; float r; int model; } obj_place;
+static unsigned char *obj_file, *obj_arena;
+static obj_model *obj_models;
+static nj_model *obj_meshes;
+static obj_place *obj_places;
+static int obj_nmodels, obj_nmeshes, obj_nplaces, obj_ncols;
+static nj_texname obj_texnames[OBJ_TEX_MAX];
+static struct { nj_texname *textures; u32 n; } obj_texlist = { obj_texnames, 0 };
+static u32 obj_gbix0;
+static char obj_pack[17];
+static int obj_tex_tried, obj_drawn;
+// Water (step 6): models with flags (1 << 1).  Their meshes' textures are
+// frames of the pack SXWATER (792500 + frame, the same for every map),
+// changed 16 times a second (Cabela's TextureAnim(2.0, 32 frames), read
+// as 32 frames in 2 seconds), drawn after everything else with depth
+// writes off, like Cabela's ZWriteDisable().
+// Then the map's reflection picture (Cabela's stage 2, StageOp(SHADER_ADD)),
+// added and weighted by its alpha (190, the frames' 75%): src alpha (4,
+// (1 << 31)), dst one (1, (1 << 26)); unlit.  Not on the tiles' own uv (it
+// repeated every tile, 105 feet): one flat square per tile, built at load
+// (water_env_*), uv from the world position, the picture every
+// WATER_ENV_SPAN units, mirrored (flip u, flip v: (1 << 18), (1 << 17)).
+// Pack entries 32 to 37; which one: maps\<map>_col.bin byte 12 (water_env,
+// 1 to 6, 0 = none).
+#define WATER_GBIX0 792500u
+#define WATER_TEX 38
+static nj_texname water_texnames[WATER_TEX];
+static struct { nj_texname *textures; u32 n; } water_texlist = { water_texnames, WATER_TEX };
+static int water_tex_tried, water_drawn;
+static u32 water_env;
+#define WATER_ENV_SPAN 1280.0f              // 128 m, about 420 feet
+static unsigned char *water_env_mem;
+static int water_env_quads;
+static nj_meshset water_env_set;
+static nj_material water_env_mat;
+static nj_model water_env_model;
+static float water_time;
+
+static void obj_free(int (__stdcall *vf)(void *, u32, u32))
+{
+    for (int i = 0; i < obj_nmeshes; i++) buffers_free(obj_meshes[i].sets, 1);
+    if (obj_file) vf(obj_file, 0, 0x8000);
+    if (obj_arena) vf(obj_arena, 0, 0x8000);
+    if (water_env_mem) { buffers_free(&water_env_set, 1); vf(water_env_mem, 0, 0x8000); }
+    water_env_mem = 0; water_env_quads = 0;
+    obj_file = obj_arena = 0;
+    obj_nmodels = obj_nmeshes = obj_nplaces = obj_ncols = 0;
+    obj_texlist.n = 0;
+    water_tex_tried = 0;
+}
+
+static void obj_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                     int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                     int (__stdcall *cl)(void *))
+{
+    char name[400];
+    u32 e = 0;                           // <mod folder>\maps\<map>_obj.bin
+    for (; e < map_dir_n; e++) name[e] = map_dir[e];
+    for (const char *t = "\\maps\\"; *t; ) name[e++] = *t++;
+    for (const char *t = map_ids[k]; *t; ) name[e++] = *t++;
+    for (const char *t = "_obj.bin"; *t; ) name[e++] = *t++;
+    name[e] = 0;
+    void *h = cf(name, 0x80000000u, 1, 0, 3, 0, 0);
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] map: %s not found, no rocks or plants\n", name); return; }
+    u32 size = fs(h, 0), got = 0;
+    unsigned char *b = size > 40 && size < (64u << 20) ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+    int ok = b && rf(h, b, size, &got, 0) && got == size;
+    cl(h);
+    obj_file = b;                        // freed by the next map_open, whatever happens here
+    const u32 *hd = (const u32 *)b;
+    if (!ok || hd[0] != 0x424F5853u /* "SXOB" */ || hd[1] != 1 || hd[4] > OBJ_TEX_MAX || hd[2] > 256) {
+        PrintDebug("[SADX Truck] map: %s is not the shape this sadxtruck.dll reads, no rocks or plants\n", name);
+        return;
+    }
+    int nm = (int)hd[2], np = (int)hd[3];
+    obj_texlist.n = hd[4]; obj_gbix0 = hd[5];
+    for (int i = 0; i < 16; i++) obj_pack[i] = (char)b[24 + i];
+    obj_pack[16] = 0;
+    // Pass 1: count meshes and collision points, find where things start.
+    unsigned char *p = b + 40;
+    int nmesh = 0, ncolpt = 0;
+    unsigned char *mstart = p;
+    static int colpts[256];
+    for (int i = 0; i < nm && i < 256; i++) {
+        u32 nme = *(u32 *)(p + 8);
+        p += 12;
+        for (u32 j = 0; j < nme; j++) {
+            u32 nv = ((u32 *)p)[2], nt = ((u32 *)p)[3];
+            p += 16 + nv * 24 + ((nt * 6 + 3) & ~3u) + nt * 12;
+        }
+        u32 cn = ((u32 *)p)[0], ct = ((u32 *)p)[1];
+        colpts[i] = (int)cn;
+        p += 8 + cn * 12 + ((ct * 6 + 3) & ~3u);
+        nmesh += (int)nme;
+    }
+    unsigned char *pstart = p;
+    if (pstart + np * 52 != b + size) { PrintDebug("[SADX Truck] map: %s: sizes don't add up, no rocks or plants\n", name); return; }
+    for (int j = 0; j < np; j++) {
+        u32 m = *(u32 *)(pstart + j * 52);
+        if (m < (u32)nm && colpts[m]) { obj_ncols++; ncolpt += colpts[m]; }
+    }
+    // One block for everything made here.
+    u32 need = nm * sizeof(obj_model) + nmesh * (sizeof(nj_model) + sizeof(nj_meshset) + sizeof(nj_material))
+             + np * sizeof(obj_place)
+             + obj_ncols * (sizeof(nj_model) + sizeof(nj_meshset) + sizeof(nj_object)) + ncolpt * 24
+             + (MAP_BLOCKS + 4 + obj_ncols) * sizeof(map_col) + 64;
+    unsigned char *a = VirtualAlloc(0, need, 0x3000, 4);
+    if (!a) { PrintDebug("[SADX Truck] map: no memory for the rocks and plants (%u bytes)\n", need); return; }
+    obj_arena = a;
+    obj_models = (obj_model *)a; a += nm * sizeof(obj_model);
+    obj_meshes = (nj_model *)a; a += nmesh * sizeof(nj_model);
+    nj_meshset *sets = (nj_meshset *)a; a += nmesh * sizeof(nj_meshset);
+    nj_material *mats = (nj_material *)a; a += nmesh * sizeof(nj_material);
+    obj_places = (obj_place *)a; a += np * sizeof(obj_place);
+    // Pass 2: models.
+    static unsigned char *colat[256];
+    static u32 colnt[256];
+    p = mstart;
+    int mi = 0;
+    for (int i = 0; i < nm && i < 256; i++) {
+        obj_models[i].flags = (int)((u32 *)p)[0];
+        obj_models[i].rad = ((float *)p)[1];
+        u32 nme = ((u32 *)p)[2];
+        obj_models[i].first = mi; obj_models[i].n = (int)nme;
+        p += 12;
+        for (u32 j = 0; j < nme; j++, mi++) {
+            u32 tex = ((u32 *)p)[0], alpha = ((u32 *)p)[1], nv = ((u32 *)p)[2], nt = ((u32 *)p)[3];
+            p += 16;
+            float *pts = (float *)p; p += nv * 12;
+            float *nrm = (float *)p; p += nv * 12;
+            short *tris = (short *)p; p += (nt * 6 + 3) & ~3u;
+            short *uv = (short *)p; p += nt * 12;
+            nj_material *mt = &mats[mi];
+            mt->diffuse = 0xFFB2B2B2u; mt->specular = 0; mt->exponent = 11.0f; mt->tex = tex;
+            // texture, both sides, src alpha / inverse src alpha; see-through
+            // parts (Cabela's alpha test): use the texture's alpha too
+            mt->flags = (1u << 21) | (1u << 23) | (1u << 31) | (1u << 28) | (1u << 26) | (alpha ? (1u << 20) : 0);
+            if (obj_models[i].flags & (1 << 1)) mt->tex = 0;   // water: the frame, set when drawn
+            nj_meshset *st = &sets[mi];
+            st->type_mat = 0; st->n = (unsigned short)nt; st->meshes = tris; st->uv = uv;
+            st->attrs = st->normals = st->colors = 0; st->buffer = 0;
+            nj_model *md = &obj_meshes[mi];
+            md->points = pts; md->normals = nrm; md->npoints = (int)nv;
+            md->sets = st; md->mats = mt; md->nsets = 1; md->nmats = 1;
+            md->center[0] = md->center[1] = md->center[2] = 0; md->r = obj_models[i].rad;
+            md->buffer = 0;
+        }
+        u32 cn = ((u32 *)p)[0], ct = ((u32 *)p)[1];
+        colat[i] = p + 8; colnt[i] = ct;
+        p += 8 + cn * 12 + ((ct * 6 + 3) & ~3u);
+    }
+    obj_nmodels = nm; obj_nmeshes = nmesh;
+    // Landtable: the fixed part, then one piece per copy with a shape.
+    map_col *cols = (map_col *)a; a += (MAP_BLOCKS + 4 + obj_ncols) * sizeof(map_col);
+    for (int i = 0; i < MAP_BLOCKS + 4; i++) cols[i] = map_cols_base[i];
+    int ci = MAP_BLOCKS + 4;
+    // Pass 3: copies.
+    for (int j = 0; j < np; j++) {
+        const unsigned char *q = pstart + j * 52;
+        u32 m = *(const u32 *)q;
+        const float *r = (const float *)(q + 4);
+        obj_place *pl = &obj_places[j];
+        pl->model = m < (u32)nm ? (int)m : 0;
+        for (int row = 0; row < 3; row++) {
+            pl->m[row * 4] = r[row * 3]; pl->m[row * 4 + 1] = r[row * 3 + 1]; pl->m[row * 4 + 2] = r[row * 3 + 2]; pl->m[row * 4 + 3] = 0;
+        }
+        pl->m[12] = r[9] + MAP_OFF_X; pl->m[13] = r[10]; pl->m[14] = r[11] + MAP_OFF_Z; pl->m[15] = 1;
+        float sc = 0;
+        for (int row = 0; row < 3; row++) {
+            float l = r[row * 3] * r[row * 3] + r[row * 3 + 1] * r[row * 3 + 1] + r[row * 3 + 2] * r[row * 3 + 2];
+            if (l > sc) sc = l;
+        }
+        pl->r = obj_models[pl->model].rad * sqrt_f(sc);
+        int cn = colpts[pl->model];
+        if (!cn) continue;
+        // The shape, moved into place: world = x * row 0 + y * row 1 + z * row 2 + position.
+        const float *src = (const float *)colat[pl->model];
+        u32 ct = colnt[pl->model];
+        const short *tris = (const short *)(colat[pl->model] + cn * 12);
+        float *wp = (float *)a; a += cn * 12;
+        float *wn = (float *)a; a += cn * 12;
+        float lo[3], hi[3];
+        for (int v = 0; v < cn; v++) {
+            for (int i = 0; i < 3; i++) {
+                wp[v * 3 + i] = src[v * 3] * pl->m[i] + src[v * 3 + 1] * pl->m[4 + i] + src[v * 3 + 2] * pl->m[8 + i] + pl->m[12 + i];
+                if (!v || wp[v * 3 + i] < lo[i]) lo[i] = wp[v * 3 + i];
+                if (!v || wp[v * 3 + i] > hi[i]) hi[i] = wp[v * 3 + i];
+                wn[v * 3 + i] = 0;
+            }
+        }
+        // Point normals: the sum of the faces around each point, made 1 long.
+        for (u32 tt = 0; tt < ct; tt++) {
+            int i0 = tris[tt * 3], i1 = tris[tt * 3 + 1], i2 = tris[tt * 3 + 2];
+            if (i0 >= cn || i1 >= cn || i2 >= cn) continue;
+            float e1[3], e2[3];
+            for (int i = 0; i < 3; i++) { e1[i] = wp[i1 * 3 + i] - wp[i0 * 3 + i]; e2[i] = wp[i2 * 3 + i] - wp[i0 * 3 + i]; }
+            float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+            for (int i = 0; i < 3; i++) { wn[i0 * 3 + i] += n[i]; wn[i1 * 3 + i] += n[i]; wn[i2 * 3 + i] += n[i]; }
+        }
+        for (int v = 0; v < cn; v++) {
+            float l = wn[v * 3] * wn[v * 3] + wn[v * 3 + 1] * wn[v * 3 + 1] + wn[v * 3 + 2] * wn[v * 3 + 2];
+            if (l > 1e-12f) { l = 1.0f / sqrt_f(l); wn[v * 3] *= l; wn[v * 3 + 1] *= l; wn[v * 3 + 2] *= l; }
+            else wn[v * 3 + 1] = 1.0f;
+        }
+        nj_meshset *st = (nj_meshset *)a; a += sizeof(nj_meshset);
+        nj_model *md = (nj_model *)a; a += sizeof(nj_model);
+        nj_object *o = (nj_object *)a; a += sizeof(nj_object);
+        st->type_mat = 0; st->n = (unsigned short)ct; st->meshes = (short *)tris;
+        st->attrs = st->normals = st->colors = 0; st->uv = 0; st->buffer = 0;
+        float c[3], rr = 0;
+        for (int i = 0; i < 3; i++) c[i] = (lo[i] + hi[i]) / 2;
+        for (int v = 0; v < cn; v++) {
+            float dx = wp[v * 3] - c[0], dy = wp[v * 3 + 1] - c[1], dz = wp[v * 3 + 2] - c[2];
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > rr) rr = d2;
+        }
+        rr = sqrt_f(rr);
+        md->points = wp; md->normals = wn; md->npoints = cn;
+        md->sets = st; md->mats = &map_mats[0]; md->nsets = 1; md->nmats = 1;
+        md->center[0] = c[0]; md->center[1] = c[1]; md->center[2] = c[2]; md->r = rr; md->buffer = 0;
+        o->eval = (1u << 0) | (1u << 1) | (1u << 2);
+        o->model = md; o->pos[0] = o->pos[1] = o->pos[2] = 0; o->ang[0] = o->ang[1] = o->ang[2] = 0;
+        o->scl[0] = o->scl[1] = o->scl[2] = 1.0f; o->child = o->sibling = 0;
+        map_col *mc = &cols[ci++];
+        mc->c[0] = c[0]; mc->c[1] = c[1]; mc->c[2] = c[2]; mc->r = rr;
+        mc->wy = mc->wz = 0; mc->blockbits = 0;
+        mc->obj = o;
+        mc->flags = 1 << 0;                             // solid, not drawn by SADX
+    }
+    obj_nplaces = np;
+    // Water reflection: one flat square per water copy, world points.
+    int nw = 0;
+    for (int j = 0; j < np; j++) if (obj_models[obj_places[j].model].flags & (1 << 1)) nw++;
+    if (nw && nw < 10000) {
+        u32 wneed = nw * (4 * 12 * 2 + 6 * 2 + 6 * 4) + 64;
+        unsigned char *w = VirtualAlloc(0, wneed, 0x3000, 4);
+        if (w) {
+            water_env_mem = w;
+            float *wp = (float *)w, *wn = wp + nw * 12;
+            short *wt = (short *)(wn + nw * 12), *wuv = wt + nw * 6;
+            float lo[3], hi[3];
+            int q = 0;
+            for (int j = 0; j < np; j++) {
+                const obj_place *pl = &obj_places[j];
+                if (!(obj_models[pl->model].flags & (1 << 1))) continue;
+                // The tile is 32 x 32 m: corners at +-160 units, flat, y 0.
+                const float cx[4] = { -160, 160, 160, -160 }, cz[4] = { -160, -160, 160, 160 };
+                float *p4 = wp + q * 12;
+                for (int c = 0; c < 4; c++)
+                    for (int i = 0; i < 3; i++) {
+                        p4[c * 3 + i] = cx[c] * pl->m[i] + cz[c] * pl->m[8 + i] + pl->m[12 + i];
+                        if ((!q && !c) || p4[c * 3 + i] < lo[i]) lo[i] = p4[c * 3 + i];
+                        if ((!q && !c) || p4[c * 3 + i] > hi[i]) hi[i] = p4[c * 3 + i];
+                    }
+                for (int c = 0; c < 4; c++) { wn[q * 12 + c * 3] = 0; wn[q * 12 + c * 3 + 1] = 1; wn[q * 12 + c * 3 + 2] = 0; }
+                const short tri[6] = { 0, 1, 2, 0, 2, 3 };
+                for (int c = 0; c < 6; c++) {
+                    int v = tri[c];
+                    wt[q * 6 + c] = (short)(q * 4 + v);
+                    float u = (p4[v * 3] - MAP_OFF_X) / WATER_ENV_SPAN, vv = (p4[v * 3 + 2] - MAP_OFF_Z) / WATER_ENV_SPAN;
+                    wuv[(q * 6 + c) * 2] = (short)(u * 255.0f);
+                    wuv[(q * 6 + c) * 2 + 1] = (short)(vv * 255.0f);
+                }
+                q++;
+            }
+            water_env_quads = q;
+            nj_meshset *s = &water_env_set;
+            s->type_mat = 0; s->n = (unsigned short)(q * 2); s->meshes = wt; s->uv = wuv;
+            s->attrs = s->normals = s->colors = 0; s->buffer = 0;
+            water_env_mat.diffuse = 0xFFFFFFFFu; water_env_mat.specular = 0; water_env_mat.exponent = 11.0f;
+            water_env_mat.tex = 32;              // set to the map's picture when drawn
+            water_env_mat.flags = (1u << 21) | (1u << 23) | (1u << 20) | (1u << 25) | (1u << 18) | (1u << 17)
+                                | (1u << 31) | (1u << 26);
+            nj_model *md = &water_env_model;
+            md->points = wp; md->normals = wn; md->npoints = q * 4;
+            md->sets = s; md->mats = &water_env_mat; md->nsets = 1; md->nmats = 1;
+            float r = 0;
+            for (int i = 0; i < 3; i++) { md->center[i] = (lo[i] + hi[i]) / 2; if (hi[i] - lo[i] > r) r = hi[i] - lo[i]; }
+            md->r = r; md->buffer = 0;
+        }
+    }
+    map_cols = cols;
+    map_lt.ncol = (short)ci; map_lt.col = map_cols;
+    obj_tex_tried = 0;
+    for (int i = 0; i < OBJ_TEX_MAX; i++) obj_texnames[i].texaddr = 0;
+    PrintDebug("[SADX Truck] map: rocks and plants: %d models (%d meshes), %d copies, %d of them solid (%d landtable pieces), %u textures\n",
+               nm, nmesh, np, obj_ncols, ci, obj_texlist.n);
+}
+
+static void obj_textures(void)
+{
+    if (!obj_texlist.n) return;
+    int ok = 1;
+    for (u32 i = 0; i < obj_texlist.n; i++) {
+        const u32 *slot = (const u32 *)obj_texnames[i].texaddr;
+        if (!slot || slot[0] != obj_gbix0 + i) ok = 0;
+    }
+    if (ok) { obj_tex_tried = 0; return; }
+    if (obj_tex_tried) return;
+    obj_tex_tried = 1;
+    for (u32 i = 0; i < obj_texlist.n; i++) obj_texnames[i].texaddr = 0;
+    LoadPVM(obj_pack, &obj_texlist);
+    PrintDebug("[SADX Truck] map: rock and plant textures %s: %s\n", obj_pack, obj_texnames[0].texaddr ? "loaded" : "NOT loaded");
+}
+
+// Each copy within reach, with its own matrix on top of the camera's.
+static void obj_draw(const float *cam)
+{
+    obj_drawn = 0;
+    if (!obj_nplaces || !obj_texlist.n) return;
+    obj_textures();
+    njSetTexture(&obj_texlist);
+    for (int j = 0; j < obj_nplaces; j++) {
+        const obj_place *pl = &obj_places[j];
+        const obj_model *om = &obj_models[pl->model];
+        float dx = pl->m[12] - cam[0], dy = pl->m[13] - cam[1], dz = pl->m[14] - cam[2];
+        if (om->flags & (1 << 1)) continue;             // water: water_draw
+        float reach = ((om->flags & 1) ? OBJ_FAR : OBJ_NEAR) + pl->r;
+        if (dx * dx + dy * dy + dz * dz > reach * reach) continue;
+        njPushMatrixEx();
+        nj_apply(pl->m);
+        for (int i = 0; i < om->n; i++) draw_buffered(&obj_meshes[om->first + i]);
+        njPopMatrixEx();
+        obj_drawn++;
+    }
+}
+
+static void water_draw(const float *cam)
+{
+    water_drawn = 0;
+    if (!obj_nplaces) return;
+    int ok = 1;
+    for (int i = 0; i < WATER_TEX; i++) {
+        const u32 *slot = (const u32 *)water_texnames[i].texaddr;
+        if (!slot || slot[0] != WATER_GBIX0 + (u32)i) ok = 0;
+    }
+    if (!ok) {
+        if (water_tex_tried) return;
+        water_tex_tried = 1;
+        for (int i = 0; i < WATER_TEX; i++) water_texnames[i].texaddr = 0;
+        LoadPVM("SXWATER", &water_texlist);
+        PrintDebug("[SADX Truck] map: water textures SXWATER: %s\n", water_texnames[0].texaddr ? "loaded" : "NOT loaded");
+        if (!water_texnames[WATER_TEX - 1].texaddr) return;
+    }
+    water_time += 1.0f / 60.0f;
+    if (water_time >= 2.0f) water_time -= 2.0f;
+    u32 frame = (u32)(water_time * 16.0f) & 31u;
+    njSetTexture(&water_texlist);
+    Direct3D_EnableZWrite(0);
+    for (int j = 0; j < obj_nplaces; j++) {
+        const obj_place *pl = &obj_places[j];
+        const obj_model *om = &obj_models[pl->model];
+        if (!(om->flags & (1 << 1))) continue;
+        float dx = pl->m[12] - cam[0], dy = pl->m[13] - cam[1], dz = pl->m[14] - cam[2];
+        float reach = OBJ_FAR + pl->r;
+        if (dx * dx + dy * dy + dz * dz > reach * reach) continue;
+        njPushMatrixEx();
+        nj_apply(pl->m);
+        for (int i = 0; i < om->n; i++) {
+            nj_model *md = &obj_meshes[om->first + i];
+            md->mats->tex = frame;
+            draw_buffered(md);
+        }
+        njPopMatrixEx();
+        water_drawn++;
+    }
+    if (water_env && water_env_quads && water_drawn) {
+        water_env_mat.tex = 31 + water_env;
+        njPushMatrixEx();
+        draw_buffered(&water_env_model);
+        njPopMatrixEx();
+    }
+    Direct3D_EnableZWrite(1);
+}
+
+// ---- Buildings' collision (step 5b) ------------------------------------
+// maps\<map>_col.bin from map_to_bin.py (its comment has the layout):
+// Cabela's invisible brushes around buildings, bridges, ramps and fences,
+// already turned into triangles, in pieces of about 164 feet square.
+// Each piece becomes one more solid landtable piece after the rocks'.
+// The points stay in the file's memory (the map offset added once here).
+static unsigned char *bc_file, *bc_arena;
+static int bc_pieces;
+
+static void bc_free(int (__stdcall *vf)(void *, u32, u32))
+{
+    if (bc_file) vf(bc_file, 0, 0x8000);
+    if (bc_arena) vf(bc_arena, 0, 0x8000);
+    bc_file = bc_arena = 0;
+    water_env = 0;
+    bc_pieces = 0;
+}
+
+static void bc_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                    int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                    int (__stdcall *cl)(void *))
+{
+    char name[400];
+    u32 e = 0;                           // <mod folder>\maps\<map>_col.bin
+    for (; e < map_dir_n; e++) name[e] = map_dir[e];
+    for (const char *t = "\\maps\\"; *t; ) name[e++] = *t++;
+    for (const char *t = map_ids[k]; *t; ) name[e++] = *t++;
+    for (const char *t = "_col.bin"; *t; ) name[e++] = *t++;
+    name[e] = 0;
+    void *h = cf(name, 0x80000000u, 1, 0, 3, 0, 0);
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] map: %s not found, buildings are not solid\n", name); return; }
+    u32 size = fs(h, 0), got = 0;
+    unsigned char *b = size >= 16 && size < (64u << 20) ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+    int ok = b && rf(h, b, size, &got, 0) && got == size;
+    cl(h);
+    bc_file = b;                         // freed by the next map_open, whatever happens here
+    const u32 *hd = (const u32 *)b;
+    if (!ok || hd[0] != 0x4C435853u /* "SXCL" */ || (hd[1] != 1 && hd[1] != 2) || hd[2] > 30000) {
+        PrintDebug("[SADX Truck] map: %s is not the shape this sadxtruck.dll reads, buildings are not solid\n", name);
+        return;
+    }
+    int np = (int)hd[2];
+    u32 hw = hd[1] == 2 ? 12 : 8;        // version 2: u32 flags first in each piece
+    water_env = hd[1] == 2 && hd[3] <= 6 ? hd[3] : 0;
+    // Check the sizes add up before using anything.
+    unsigned char *p = b + 16;
+    for (int i = 0; i < np; i++) {
+        if (p + hw > b + size) { p = 0; break; }
+        u32 n = ((u32 *)(p + hw - 8))[0], nt = ((u32 *)(p + hw - 8))[1];
+        if (n > 65535 || nt > 65535) { p = 0; break; }
+        p += hw + n * 24 + ((nt * 6 + 3) & ~3u);
+    }
+    if (p != b + size) { PrintDebug("[SADX Truck] map: %s: sizes don't add up, buildings are not solid\n", name); return; }
+    int old = map_lt.ncol;
+    if (old + np > 32000) { PrintDebug("[SADX Truck] map: too many landtable pieces (%d), buildings are not solid\n", old + np); return; }
+    u32 need = np * (sizeof(nj_meshset) + sizeof(nj_model) + sizeof(nj_object)) + (old + np) * sizeof(map_col) + 64;
+    unsigned char *a = VirtualAlloc(0, need, 0x3000, 4);
+    if (!a) { PrintDebug("[SADX Truck] map: no memory for the buildings' collision (%u bytes)\n", need); return; }
+    bc_arena = a;
+    map_col *cols = (map_col *)a; a += (old + np) * sizeof(map_col);
+    for (int i = 0; i < old; i++) cols[i] = map_cols[i];
+    int ci = old, nwater = 0;
+    p = b + 16;
+    for (int i = 0; i < np; i++) {
+        u32 pflags = hw == 12 ? ((u32 *)p)[0] & ((1u << 0) | (1u << 1)) : (1u << 0);   // solid or water only
+        u32 n = ((u32 *)(p + hw - 8))[0], nt = ((u32 *)(p + hw - 8))[1];
+        float *wp = (float *)(p + hw);
+        float *wn = wp + n * 3;
+        short *tris = (short *)(wn + n * 3);
+        p += hw + n * 24 + ((nt * 6 + 3) & ~3u);
+        if (!pflags) continue;
+        if (!n || !nt) continue;
+        float lo[3], hi[3];
+        for (u32 v = 0; v < n; v++) {
+            wp[v * 3] += MAP_OFF_X; wp[v * 3 + 2] += MAP_OFF_Z;
+            for (int j = 0; j < 3; j++) {
+                if (!v || wp[v * 3 + j] < lo[j]) lo[j] = wp[v * 3 + j];
+                if (!v || wp[v * 3 + j] > hi[j]) hi[j] = wp[v * 3 + j];
+            }
+        }
+        float c[3], rr = 0;
+        for (int j = 0; j < 3; j++) c[j] = (lo[j] + hi[j]) / 2;
+        for (u32 v = 0; v < n; v++) {
+            float dx = wp[v * 3] - c[0], dy = wp[v * 3 + 1] - c[1], dz = wp[v * 3 + 2] - c[2];
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > rr) rr = d2;
+        }
+        rr = sqrt_f(rr);
+        nj_meshset *st = (nj_meshset *)a; a += sizeof(nj_meshset);
+        nj_model *md = (nj_model *)a; a += sizeof(nj_model);
+        nj_object *o = (nj_object *)a; a += sizeof(nj_object);
+        st->type_mat = 0; st->n = (unsigned short)nt; st->meshes = tris;
+        st->attrs = st->normals = st->colors = 0; st->uv = 0; st->buffer = 0;
+        md->points = wp; md->normals = wn; md->npoints = (int)n;
+        md->sets = st; md->mats = &map_mats[0]; md->nsets = 1; md->nmats = 1;
+        md->center[0] = c[0]; md->center[1] = c[1]; md->center[2] = c[2]; md->r = rr; md->buffer = 0;
+        o->eval = (1u << 0) | (1u << 1) | (1u << 2);
+        o->model = md; o->pos[0] = o->pos[1] = o->pos[2] = 0; o->ang[0] = o->ang[1] = o->ang[2] = 0;
+        o->scl[0] = o->scl[1] = o->scl[2] = 1.0f; o->child = o->sibling = 0;
+        map_col *mc = &cols[ci++];
+        mc->c[0] = c[0]; mc->c[1] = c[1]; mc->c[2] = c[2]; mc->r = rr;
+        mc->wy = mc->wz = 0; mc->blockbits = 0;
+        mc->obj = o;
+        mc->flags = (int)pflags;                        // solid or water, not drawn by SADX
+        if (pflags & (1u << 1)) nwater++;
+    }
+    bc_pieces = ci - old;
+    map_cols = cols;
+    map_lt.ncol = (short)ci; map_lt.col = map_cols;
+    PrintDebug("[SADX Truck] map: buildings' collision and water: %d pieces, %d of them water (%d landtable pieces in all)\n", bc_pieces, nwater, ci);
+}
+
+// ---- Sky (step 6) --------------------------------------------------------
+// maps\<map>_sky.bin from map_to_bin.py (its comment has the layout and
+// what Cabela's does): 6 faces of 8 x 8 patches, each point a direction.
+// Here the directions times SKY_R around the camera: every point the same
+// distance away, so from the middle it looks like Cabela's cube.  Drawn
+// first in map_draw with depth writes off and the depth test on: anything
+// nearer covers it (the ground ends at MAP_DRAW + a block, about 4,500),
+// whatever order SADX draws in.  Per face: the clouds (opaque, scrolled
+// like Cabela's Translate("Time", 0.015, 0, "Time", 0.005, 0): their uv
+// rewritten each frame), then the face's picture by its alpha; the bottom
+// face: the bottom color.  Unlit, not from SADX's buffers (the uv move).
+// SADX's view distance: ___njClipZ (0x403180, SADXFunctionsNew.h; levels
+// pass near -1 and far -3000, Station Square's 0x4209D7) set to SKY_CLIP
+// each frame on the map, in map_frame (before anything draws, so the
+// whole frame uses the same depth range).
+// Depth: Direct3D_EnableZWrite (0x77ED20, SADXFunctions.h).
+#define SKY_R 9000.0f
+#define SKY_CLIP 12000.0f
+#define njClipZ ((void (__cdecl *)(float, float))0x403180)
+#define SKY_PTS 256
+#define SKY_TRIS 128
+static unsigned char *sky_file;
+static float sky_pts[6][SKY_PTS][3], sky_nrm[6][SKY_PTS][3];
+static short sky_tris[SKY_TRIS * 3];
+static short sky_pic_uv[6][SKY_TRIS * 3][2], sky_cloud_uv[6][SKY_TRIS * 3][2];
+static const float *sky_cloud_src[6];             // the file's cloud u v per point (7 floats a point)
+static nj_material sky_mats[6][2];
+static nj_meshset sky_sets[6][2];
+static nj_model sky_models[6][2];
+static int sky_layers[6];                         // 0, 1 or 2 models per face
+static nj_texname sky_texnames[8];
+static struct { nj_texname *textures; u32 n; } sky_texlist = { sky_texnames, 0 };
+static u32 sky_gbix0;
+static char sky_pack[17];
+static int sky_tex_tried, sky_ok;
+static float sky_time;
+// Fog (step 6): level 11 has no fog table in SADX (pFogTable_Stg00 to
+// Stg10 and Stg12, SADXVariablesNew.h; no Stg11), so it kept the fog of
+// the Station Square act it came from.  Each frame on the map: gFog
+// (0x3ABDC60: f32 start, f32 end, both negative like SADX's own tables,
+// u32 color, u8 on) = Cabela's fog for the map (maps\<map>_sky.bin
+// version 2), then ___njFogEnable (0x411AF0), which copies gFog to the
+// screen.  The sky is drawn with fog off (___njFogDisable, 0x411B40),
+// like Cabela's FogDisable() in its sky shaders.
+#define gFog ((float *)0x3ABDC60)
+#define njFogEnable ((void (__cdecl *)(void))0x411AF0)
+#define njFogDisable ((void (__cdecl *)(void))0x411B40)
+static int sky_fog;                       // 1 = the file had a fog
+static float sky_fog_start, sky_fog_end;  // SADX units, positive
+static u32 sky_fog_color;
+
+static void sky_free(int (__stdcall *vf)(void *, u32, u32))
+{
+    if (sky_file) vf(sky_file, 0, 0x8000);
+    sky_file = 0; sky_ok = 0; sky_texlist.n = 0; sky_fog = 0;
+}
+
+static void sky_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                     int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                     int (__stdcall *cl)(void *))
+{
+    char name[400];
+    u32 e = 0;                           // <mod folder>\maps\<map>_sky.bin
+    for (; e < map_dir_n; e++) name[e] = map_dir[e];
+    for (const char *t = "\\maps\\"; *t; ) name[e++] = *t++;
+    for (const char *t = map_ids[k]; *t; ) name[e++] = *t++;
+    for (const char *t = "_sky.bin"; *t; ) name[e++] = *t++;
+    name[e] = 0;
+    void *h = cf(name, 0x80000000u, 1, 0, 3, 0, 0);
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] map: %s not found, no sky\n", name); return; }
+    u32 size = fs(h, 0), got = 0;
+    const u32 want = 32 + 6 * (8 + SKY_PTS * 28);    // version 1; version 2: + 12 bytes of fog
+    unsigned char *b = size == want || size == want + 12 ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+    int ok = b && rf(h, b, size, &got, 0) && got == size;
+    cl(h);
+    sky_file = b;
+    const u32 *hd = (const u32 *)b;
+    if (!ok || hd[0] != 0x4B535853u /* "SXSK" */ || hd[1] != (size == want ? 1u : 2u)) {
+        PrintDebug("[SADX Truck] map: %s is not the shape this sadxtruck.dll reads, no sky\n", name);
+        return;
+    }
+    sky_gbix0 = hd[2];
+    if (hd[1] == 2) {
+        const float *fg = (const float *)(b + want);
+        sky_fog_start = fg[0]; sky_fog_end = fg[1]; sky_fog_color = ((const u32 *)fg)[2];
+        sky_fog = sky_fog_end > sky_fog_start;
+    }
+    for (int i = 0; i < 16; i++) sky_pack[i] = (char)b[12 + i];
+    sky_pack[16] = 0;
+    u32 bottom = hd[7];
+    int ntex = 1;
+    for (int p = 0; p < 64; p++) {
+        const short q[6] = { 0, 1, 3, 3, 2, 0 };
+        for (int c = 0; c < 6; c++) sky_tris[p * 6 + c] = (short)(p * 4 + q[c]);
+    }
+    const unsigned char *fp = b + 32;
+    for (int f = 0; f < 6; f++, fp += 8 + SKY_PTS * 28) {
+        int pic = ((const int *)fp)[0], clouds = (int)((const u32 *)fp)[1];
+        const float *src = (const float *)(fp + 8);
+        for (int v = 0; v < SKY_PTS; v++)
+            for (int i = 0; i < 3; i++) { sky_pts[f][v][i] = src[v * 7 + i] * SKY_R; sky_nrm[f][v][i] = -src[v * 7 + i]; }
+        sky_cloud_src[f] = src;
+        for (int c = 0; c < SKY_TRIS * 3; c++) {
+            int v = sky_tris[c];
+            sky_pic_uv[f][c][0] = (short)(src[v * 7 + 3] * 255.0f + 0.5f);
+            sky_pic_uv[f][c][1] = (short)(src[v * 7 + 4] * 255.0f + 0.5f);
+        }
+        int n = 0;
+        // texture, both sides, unlit; blending src alpha / inverse src alpha
+        const u32 base = (1u << 23) | (1u << 25) | (1u << 31) | (1u << 28) | (1u << 26);
+        if (!clouds && pic < 0) {                        // the bottom: one color
+            sky_mats[f][0].diffuse = bottom; sky_mats[f][0].flags = base; sky_mats[f][0].tex = 0;
+            sky_sets[f][0].uv = 0;
+            n = 1;
+        }
+        if (clouds) {
+            sky_mats[f][n].diffuse = 0xFFFFFFFFu; sky_mats[f][n].flags = base | (1u << 21); sky_mats[f][n].tex = 0;
+            sky_sets[f][n].uv = &sky_cloud_uv[f][0][0];
+            n++;
+        }
+        if (pic >= 0 && pic < 8) {                       // + the picture's alpha, clamped
+            sky_mats[f][n].diffuse = 0xFFFFFFFFu;
+            sky_mats[f][n].flags = base | (1u << 21) | (1u << 20) | (1u << 16) | (1u << 15);
+            sky_mats[f][n].tex = (u32)pic;
+            sky_sets[f][n].uv = &sky_pic_uv[f][0][0];
+            if (pic + 1 > ntex) ntex = pic + 1;
+            n++;
+        }
+        for (int l = 0; l < n; l++) {
+            sky_mats[f][l].specular = 0; sky_mats[f][l].exponent = 11.0f;
+            nj_meshset *s = &sky_sets[f][l];
+            s->type_mat = 0; s->n = SKY_TRIS; s->meshes = sky_tris;
+            s->attrs = s->normals = s->colors = 0; s->buffer = 0;
+            nj_model *md = &sky_models[f][l];
+            md->points = sky_pts[f]; md->normals = sky_nrm[f]; md->npoints = SKY_PTS;
+            md->sets = s; md->mats = &sky_mats[f][l]; md->nsets = 1; md->nmats = 1;
+            md->center[0] = md->center[1] = md->center[2] = 0; md->r = SKY_R * 1.8f; md->buffer = 0;
+        }
+        sky_layers[f] = n;
+    }
+    sky_texlist.n = (u32)ntex;
+    sky_tex_tried = 0;
+    for (int i = 0; i < 8; i++) sky_texnames[i].texaddr = 0;
+    sky_ok = 1;
+    PrintDebug("[SADX Truck] map: sky: %u textures in %s, bottom color %06X; fog %s, color %06X, from %.0f to %.0f\n",
+               sky_texlist.n, sky_pack, bottom & 0xFFFFFFu, sky_fog ? "on" : "off", sky_fog_color & 0xFFFFFFu,
+               (double)sky_fog_start, (double)sky_fog_end);
+}
+
+static int sky_textures(void)
+{
+    int ok = 1;
+    for (u32 i = 0; i < sky_texlist.n; i++) {
+        const u32 *slot = (const u32 *)sky_texnames[i].texaddr;
+        if (!slot || slot[0] != sky_gbix0 + i) ok = 0;
+    }
+    if (ok) { sky_tex_tried = 0; return 1; }
+    if (sky_tex_tried) return 0;
+    sky_tex_tried = 1;
+    for (u32 i = 0; i < 8; i++) sky_texnames[i].texaddr = 0;
+    LoadPVM(sky_pack, &sky_texlist);
+    PrintDebug("[SADX Truck] map: sky textures %s: %s\n", sky_pack, sky_texnames[0].texaddr ? "loaded" : "NOT loaded");
+    return sky_texnames[0].texaddr != 0;
+}
+
+static void sky_draw(const float *cam)
+{
+    if (!sky_ok || !sky_textures()) return;
+    sky_time += 1.0f / 60.0f;
+    if (sky_time > 2000.0f) sky_time -= 2000.0f;     // 0.015 x 2000 and 0.005 x 2000: whole turns
+    float su = sky_time * 0.015f * 2.0f, sv = sky_time * 0.005f * 2.0f;
+    su -= (float)(int)su; sv -= (float)(int)sv;
+    for (int f = 0; f < 6; f++) {
+        const float *src = sky_cloud_src[f];
+        for (int c = 0; c < SKY_TRIS * 3; c++) {
+            int v = sky_tris[c];
+            float u = src[v * 7 + 5] + su, w = src[v * 7 + 6] + sv;
+            sky_cloud_uv[f][c][0] = (short)(u * 255.0f + (u < 0 ? -0.5f : 0.5f));
+            sky_cloud_uv[f][c][1] = (short)(w * 255.0f + (w < 0 ? -0.5f : 0.5f));
+        }
+    }
+    njSetTexture(&sky_texlist);
+    njFogDisable();
+    Direct3D_EnableZWrite(0);
+    float m[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  cam[0], cam[1], cam[2], 1 };
+    njPushMatrixEx();
+    nj_apply(m);
+    for (int f = 0; f < 6; f++)
+        for (int l = 0; l < sky_layers[f]; l++) njDrawModel_SADX(&sky_models[f][l]);
+    njPopMatrixEx();
+    Direct3D_EnableZWrite(1);
+    if (sky_fog) njFogEnable();
+}
+
+// ---- Grass (step 5c) ----------------------------------------------------
+// maps\<map>_grass.bin from map_to_bin.py (its comment has the layout and
+// how Cabela's grows grass: a square of tufts around the camera, where the
+// mask says).  Here the ground is cut into fixed cells of GR_T x GR_T tuft
+// spots; each cell within reach of the camera is built once (each spot: a
+// fixed nudge and turn from a hash of its number, the mask bit, the ground
+// height; a tuft is two crossed upright quads) and kept in a cache of
+// GR_CACHE cells, drawn from SADX's buffers like the ground.  The oldest
+// cell is reused (its buffer freed first).  Cells are world points, so no
+// matrix.  The texture is the last one of the map's SXOBJ pack.
+#define GR_T 16                          // tuft spots per cell side
+#define GR_CACHE 96
+#define GR_MAX (GR_T * GR_T)
+#define GR_BUILD_PER_FRAME 6             // new cells per frame at most (spreads the work)
+typedef struct {
+    int cx, cz, stamp, tufts;
+    nj_model md; nj_meshset st; nj_material mt;
+    float pts[GR_MAX * 8][3];
+    short tris[GR_MAX * 4 * 3];
+    short uv[GR_MAX * 4 * 3][2];
+} gr_cell;
+static unsigned char *gr_file;
+static gr_cell *gr_cells;
+static float gr_step, gr_w, gr_h, gr_reach, gr_mx0, gr_mdx, gr_mz0, gr_mdz;
+static u32 gr_tex, gr_mw, gr_mh;
+static const unsigned char *gr_bits;
+static int gr_stamp, gr_drawn;
+static float gr_up[GR_MAX * 8][3];       // every point's normal: straight up
+
+static void gr_free(int (__stdcall *vf)(void *, u32, u32))
+{
+    if (gr_cells) {
+        for (int i = 0; i < GR_CACHE; i++) buffers_free(&gr_cells[i].st, 1);
+        vf(gr_cells, 0, 0x8000);
+    }
+    if (gr_file) vf(gr_file, 0, 0x8000);
+    gr_cells = 0; gr_file = 0; gr_bits = 0;
+}
+
+static void gr_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *, u32, u32, void *),
+                    int (__stdcall *rf)(void *, void *, u32, u32 *, void *), u32 (__stdcall *fs)(void *, u32 *),
+                    int (__stdcall *cl)(void *))
+{
+    char name[400];
+    u32 e = 0;
+    for (; e < map_dir_n; e++) name[e] = map_dir[e];
+    for (const char *t = "\\maps\\"; *t; ) name[e++] = *t++;
+    for (const char *t = map_ids[k]; *t; ) name[e++] = *t++;
+    for (const char *t = "_grass.bin"; *t; ) name[e++] = *t++;
+    name[e] = 0;
+    void *h = cf(name, 0x80000000u, 1, 0, 3, 0, 0);
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] map: no grass file for %s (Alaska has none)\n", map_names[k]); return; }
+    u32 size = fs(h, 0), got = 0;
+    unsigned char *b = size > 56 && size < (4u << 20) ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+    int ok = b && rf(h, b, size, &got, 0) && got == size;
+    cl(h);
+    gr_file = b;
+    const u32 *hd = (const u32 *)b;
+    const float *hf = (const float *)b;
+    if (!ok || hd[0] != 0x52475853u /* "SXGR" */ || hd[1] != 1 || 56 + hd[8] * hd[9] / 8 != size || hd[7] >= obj_texlist.n) {
+        PrintDebug("[SADX Truck] map: %s is not the shape this sadxtruck.dll reads, no grass\n", name);
+        return;
+    }
+    gr_step = hf[2]; gr_w = hf[4]; gr_h = hf[5]; gr_reach = hf[6];
+    gr_tex = hd[7]; gr_mw = hd[8]; gr_mh = hd[9];
+    gr_mx0 = hf[10] + MAP_OFF_X; gr_mdx = hf[11]; gr_mz0 = hf[12] + MAP_OFF_Z; gr_mdz = hf[13];
+    gr_bits = b + 56;
+    gr_cells = VirtualAlloc(0, GR_CACHE * sizeof(gr_cell), 0x3000, 4);
+    if (!gr_cells) { PrintDebug("[SADX Truck] map: no memory for grass\n"); return; }
+    for (int i = 0; i < GR_CACHE; i++) { gr_cells[i].stamp = -1; gr_cells[i].st.buffer = 0; }
+    for (int i = 0; i < GR_MAX * 8; i++) { gr_up[i][0] = 0; gr_up[i][1] = 1; gr_up[i][2] = 0; }
+    gr_stamp = 0;
+    PrintDebug("[SADX Truck] map: grass: a tuft every %.1f units, %.0f x %.0f, within %.0f of the camera, texture %u, cache %d cells (%u KB)\n",
+               (double)gr_step, (double)gr_w, (double)gr_h, (double)gr_reach, gr_tex, GR_CACHE, (u32)(GR_CACHE * sizeof(gr_cell) / 1024));
+}
+
+// The ground's height at x z (SADX units), from the map's points: block
+// and cell from block 0's first points, then the cell's triangle
+// ((a, b, c) or (b, d, c), as drawn).  NO_GROUND off the map.
+static float map_ground_y(float x, float z)
+{
+    if (!map_file) return NO_GROUND;
+    const float *p0 = (const float *)(map_file + 64 + 20);
+    float dxc = p0[3] - p0[0];                       // x per column (negative: mirrored)
+    float dzr = p0[MAP_NP * 3 + 2] - p0[2];           // z per row
+    float gc = (x - p0[0]) / dxc, gr = (z - p0[2]) / dzr;
+    if (gc < 0 || gr < 0 || gc >= MAP_NB * MAP_CELLS || gr >= MAP_NB * MAP_CELLS) return NO_GROUND;
+    int c = (int)gc, r = (int)gr;
+    float fj = gc - c, fi = gr - r;
+    int bx = c / MAP_CELLS, bz = r / MAP_CELLS, j = c - bx * MAP_CELLS, i = r - bz * MAP_CELLS;
+    const float *pts = (const float *)(map_file + 64 + (bz * MAP_NB + bx) * MAP_BLOCK_BYTES + 20);
+    float ya = pts[(i * MAP_NP + j) * 3 + 1], yb = pts[(i * MAP_NP + j + 1) * 3 + 1];
+    float yc = pts[((i + 1) * MAP_NP + j) * 3 + 1], yd = pts[((i + 1) * MAP_NP + j + 1) * 3 + 1];
+    if (fi + fj <= 1.0f) return ya + (yb - ya) * fj + (yc - ya) * fi;
+    return yd + (yc - yd) * (1.0f - fj) + (yb - yd) * (1.0f - fi);
+}
+
+static u32 gr_hash(int a, int b, int c)
+{
+    u32 h = (u32)a * 73856093u ^ (u32)b * 19349663u ^ (u32)c * 83492791u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return h;
+}
+
+static void gr_build(gr_cell *gc, int cx, int cz)
+{
+    buffers_free(&gc->st, 1);
+    gc->cx = cx; gc->cz = cz; gc->tufts = 0;
+    int nv = 0, nt = 0;
+    for (int a = 0; a < GR_T; a++)
+        for (int bb = 0; bb < GR_T; bb++) {
+            int ix = cx * GR_T + a, iz = cz * GR_T + bb;
+            float x = (ix + (gr_hash(ix, iz, 1) & 1023) / 1024.0f) * gr_step;
+            float z = (iz + (gr_hash(ix, iz, 2) & 1023) / 1024.0f) * gr_step;
+            int col = (int)((x - gr_mx0) / gr_mdx), row = (int)((z - gr_mz0) / gr_mdz);
+            if (col < 0 || row < 0 || col >= (int)gr_mw || row >= (int)gr_mh) continue;
+            if (!(gr_bits[row * (gr_mw / 8) + col / 8] >> (col & 7) & 1)) continue;
+            float y = map_ground_y(x, z);
+            if (y == NO_GROUND) continue;
+            float ang = (gr_hash(ix, iz, 3) & 1023) * (6.2831853f / 1024.0f);
+            float ca = cos_f(ang) * gr_w * 0.5f, sa = sin_f(ang) * gr_w * 0.5f;
+            float yb = y - gr_h * 0.2f, yt = yb + gr_h;     // Cabela's: middle at ground + 0.3 x height
+            const float dir[2][2] = { { ca, sa }, { -sa, ca } };
+            for (int q = 0; q < 2; q++) {
+                float (*v)[3] = &gc->pts[nv];
+                v[0][0] = x - dir[q][0]; v[0][1] = yb; v[0][2] = z - dir[q][1];
+                v[1][0] = x + dir[q][0]; v[1][1] = yb; v[1][2] = z + dir[q][1];
+                v[2][0] = x - dir[q][0]; v[2][1] = yt; v[2][2] = z - dir[q][1];
+                v[3][0] = x + dir[q][0]; v[3][1] = yt; v[3][2] = z + dir[q][1];
+                static const short corner[6] = { 0, 1, 2, 1, 3, 2 };
+                static const short cu[4] = { 0, 255, 0, 255 }, cvv[4] = { 255, 255, 0, 0 };
+                for (int e = 0; e < 6; e++) {
+                    gc->tris[nt * 3 + e] = (short)(nv + corner[e]);
+                    gc->uv[nt * 3 + e][0] = cu[corner[e]]; gc->uv[nt * 3 + e][1] = cvv[corner[e]];
+                }
+                nv += 4; nt += 2;
+            }
+            gc->tufts++;
+        }
+    nj_material *mt = &gc->mt;
+    mt->diffuse = 0xFFB2B2B2u; mt->specular = 0; mt->exponent = 11.0f; mt->tex = gr_tex;
+    // texture, both sides, the texture's alpha, src alpha / inverse src alpha, clamped
+    mt->flags = (1u << 21) | (1u << 23) | (1u << 20) | (1u << 31) | (1u << 28) | (1u << 26) | (1u << 16) | (1u << 15);
+    nj_meshset *st = &gc->st;
+    st->type_mat = 0; st->n = (unsigned short)nt; st->meshes = gc->tris; st->uv = &gc->uv[0][0];
+    st->attrs = st->normals = st->colors = 0; st->buffer = 0;
+    nj_model *md = &gc->md;
+    md->points = gc->pts; md->normals = gr_up; md->npoints = nv;
+    md->sets = st; md->mats = mt; md->nsets = 1; md->nmats = 1;
+    md->center[0] = (cx * GR_T + GR_T * 0.5f) * gr_step; md->center[1] = 0; md->center[2] = (cz * GR_T + GR_T * 0.5f) * gr_step;
+    md->r = GR_T * gr_step; md->buffer = 0;
+}
+
+static void gr_draw(const float *cam)
+{
+    gr_drawn = 0;
+    if (!gr_cells || !obj_texlist.n) return;
+    float cs = GR_T * gr_step;
+    int c0 = (int)((cam[0] - gr_reach) / cs) - 1, c1 = (int)((cam[0] + gr_reach) / cs) + 1;
+    int z0 = (int)((cam[2] - gr_reach) / cs) - 1, z1 = (int)((cam[2] + gr_reach) / cs) + 1;
+    float reach = gr_reach + cs * 0.71f;
+    int built = 0;
+    gr_stamp++;
+    njSetTexture(&obj_texlist);
+    for (int cz = z0; cz <= z1; cz++)
+        for (int cx = c0; cx <= c1; cx++) {
+            float dx = (cx + 0.5f) * cs - cam[0], dz = (cz + 0.5f) * cs - cam[2];
+            if (dx * dx + dz * dz > reach * reach) continue;
+            gr_cell *hit = 0, *old = &gr_cells[0];
+            for (int i = 0; i < GR_CACHE; i++) {
+                gr_cell *g = &gr_cells[i];
+                if (g->stamp >= 0 && g->cx == cx && g->cz == cz) { hit = g; break; }
+                if (g->stamp < old->stamp) old = g;
+            }
+            if (!hit) {
+                if (built >= GR_BUILD_PER_FRAME || old->stamp == gr_stamp) continue;
+                gr_build(old, cx, cz);
+                built++;
+                hit = old;
+            }
+            hit->stamp = gr_stamp;
+            if (!hit->tufts) continue;
+            draw_buffered(&hit->md);
+            gr_drawn += hit->tufts;
+        }
+}
+
+static void map_textures(void)
+{
+    int ok = 1;
+    for (u32 i = 0; i < map_texlist.n; i++) {
+        const u32 *slot = (const u32 *)map_texnames[i].texaddr;
+        if (!slot || slot[0] != (i < 16 ? map_gbix0 + i : map_det_gbix)) ok = 0;
+    }
+    if (ok) { map_tex_tried = 0; return; }
+    if (map_tex_tried) return;
+    map_tex_tried = 1;
+    for (int i = 0; i < 17; i++) map_texnames[i].texaddr = 0;
+    LoadPVM(map_pack, &map_texlist);
+    PrintDebug("[SADX Truck] map textures %s: %s\n", map_pack, map_texnames[0].texaddr ? "loaded" : "NOT loaded");
+}
+
+// Frame time, once a second while the map is on: the time between two
+// draws (the whole frame) and the time inside the map's draw, from
+// kernel32's QueryPerformanceCounter.
+static int (__stdcall *map_qpc)(long long *);
+static long long map_qpf, map_t_last, map_frame_sum, map_frame_worst, map_draw_sum, map_draw_worst;
+static int map_t_frames, map_t_near, map_t_far;
+
+static void map_time_log(long long start, long long end, int nnear, int nfar)
+{
+    if (!map_qpc) {
+        void *kl = LoadLibraryExA("kernel32.dll", 0, 0);
+        int (__stdcall *qf)(long long *) = kl ? (void *)GetProcAddress(kl, "QueryPerformanceFrequency") : 0;
+        map_qpc = kl ? (void *)GetProcAddress(kl, "QueryPerformanceCounter") : 0;
+        if (!qf || !qf(&map_qpf) || map_qpf <= 0) map_qpc = 0;
+        return;
+    }
+    if (map_t_last) {
+        long long f = start - map_t_last;
+        map_frame_sum += f;
+        if (f > map_frame_worst) map_frame_worst = f;
+        map_draw_sum += end - start;
+        if (end - start > map_draw_worst) map_draw_worst = end - start;
+        map_t_near += nnear; map_t_far += nfar;
+        map_t_frames++;
+    }
+    map_t_last = start;
+    if (map_frame_sum >= map_qpf && map_t_frames) {
+        double ms = 1000.0 / (double)map_qpf, n = map_t_frames;
+        PrintDebug("[SADX Truck] map: %d frames in the last second, frame %.1f ms (worst %.1f), map draw %.1f ms, "
+                   "(worst %.1f), blocks %d full + %d far (%d triangles), %d rocks and plants, %d grass tufts, %d buffers, camera at %.0f %.0f %.0f\n",
+                   map_t_frames, map_frame_sum * ms / n, map_frame_worst * ms, map_draw_sum * ms / n, map_draw_worst * ms,
+                   (int)(map_t_near / n + 0.5), (int)(map_t_far / n + 0.5),
+                   (int)((map_t_near * MAP_CELLS * MAP_CELLS * 2 + map_t_far * MAP_FAR_CELLS * MAP_FAR_CELLS * 2) / n + 0.5), obj_drawn, gr_drawn, nj_buffers_made,
+                   camera_twp ? (double)((const float *)(camera_twp + 32))[0] : 0.0,
+                   camera_twp ? (double)((const float *)(camera_twp + 32))[1] : 0.0,
+                   camera_twp ? (double)((const float *)(camera_twp + 32))[2] : 0.0);
+        map_frame_sum = map_frame_worst = map_draw_sum = map_draw_worst = 0;
+        map_t_frames = map_t_near = map_t_far = 0;
+    }
+}
+
+static void __cdecl map_draw(char *tp)
+{
+    (void)tp;
+    if (!map_on || !camera_twp) { map_t_last = 0; return; }
+    long long t0 = 0, t1 = 0;
+    if (map_qpc) map_qpc(&t0);
+    map_textures();
+    const float *cam = (const float *)(camera_twp + 32);
+    sky_draw(cam);
+    njSetTexture(&map_texlist);
+    int nnear = 0, nfar = 0;
+    for (int k = 0; k < MAP_BLOCKS; k++) {
+        const float *c = map_models[k].center;
+        float dx = c[0] - cam[0], dy = c[1] - cam[1], dz = c[2] - cam[2];
+        float d2 = dx * dx + dy * dy + dz * dz, r = map_models[k].r;
+        float reach = MAP_DRAW + r, near = MAP_NEAR + r;
+        if (d2 > reach * reach) continue;
+        int full = d2 <= near * near;
+        if (full) nnear++; else nfar++;
+        njPushMatrixEx();
+        draw_buffered(full ? &map_models[k] : &map_far_models[k]);
+        njPopMatrixEx();
+    }
+    // Detail over the near blocks, after all the ground.
+    if (!map_det_table_ok) {
+        u32 old;
+        map_det_table_ok = VirtualProtect(NJ_BLEND_TABLE, 32, 0x04, &old) ? 1 : -1;   // PAGE_READWRITE
+        PrintDebug("[SADX Truck] map: blend table %s (entries 2, 3: %u %u)\n",
+                   map_det_table_ok > 0 ? "writable" : "NOT writable, no ground detail",
+                   map_det_table_ok > 0 ? NJ_BLEND_TABLE[2] : 0, map_det_table_ok > 0 ? NJ_BLEND_TABLE[3] : 0);
+    }
+    if (map_det_gbix && map_texnames[16].texaddr && map_det_table_ok > 0 && NJ_BLEND_TABLE[2] == 3 && NJ_BLEND_TABLE[3] == 4) {
+        NJ_BLEND_TABLE[2] = 9; NJ_BLEND_TABLE[3] = 3;        // DESTCOLOR, SRCCOLOR
+        for (int k = 0; k < MAP_BLOCKS; k++) {
+            const float *c = map_models[k].center;
+            float dx = c[0] - cam[0], dy = c[1] - cam[1], dz = c[2] - cam[2];
+            float near = MAP_NEAR + map_models[k].r;
+            if (dx * dx + dy * dy + dz * dz > near * near) continue;
+            njPushMatrixEx();
+            draw_buffered(&map_det_models[k]);
+            njPopMatrixEx();
+        }
+        NJ_BLEND_TABLE[2] = 3; NJ_BLEND_TABLE[3] = 4;        // SADX's own: SRCCOLOR, INVSRCCOLOR
+    }
+    obj_draw(cam);
+    gr_draw(cam);
+    water_draw(cam);
+    if (map_qpc) map_qpc(&t1);
+    map_time_log(t0, t1, nnear, nfar);
+}
+static void __cdecl map_exec(char *tp) { map_draw(tp); }
+static void __cdecl map_freed(char *tp) { (void)tp; map_task = 0; }
+
+// Level 11 (LevelIDs_B, never used by SADX) is the map's level.
+//
+//   Station Square, on foot, L + R 2 s  ->  level 11 act 0 (Sonic at "garage")
+//   level 11, on foot, L + R 2 s        ->  back to the Station Square act
+//                                           and the spot Sonic left from
+//
+// SADX has nothing for level 11 in any table, and its file loader
+// (LoadLevelFiles 0x422AD0) freezes on purpose for it: its switch on the
+// level sends 11 to a print of "Nothin' Module Set Cam" and an endless
+// loop.  map_patch points the switch's entry for 11 (jump table 0x4237E0,
+// entry 11 at 0x42380C) at map_files instead, which does what the end of
+// every other case does (0x4b4c70 and 0x4b4bf0 pick each act's camera and
+// object lists; byte 0x3ABDF68 = 1) and then gives every act map_cam:
+// with no camera list at all, one camera function (0x434690) would read
+// nothing, and an empty list left the camera in one spot.  The object lists stay empty; SADX checks for that.
+// Sonic's start (RegisterStartPosition) is set in Init; the landtable is
+// GeoLists[11 * 8 + 0] = map_lt.
+#define SetNextLevelAndAct_CutsceneMode ((void (__cdecl *)(unsigned char, unsigned char))0x4145D0)
+// Level 11's camera list: 64-byte header (u32 count), then one 64-byte
+// entry (_OBJ_CAMERAENTRY, SADXStructsNew.h), a copy of the first entry of
+// Station Square act 1's list (system\CAMSS00S.BIN; Mystic Ruins'
+// CAMMR00S.BIN starts the same way): CAMMD_KNUCKLES (4), the adventure
+// field camera that swings round behind the player, adjust
+// CAMADJ_RELATIVE2C (19), no zone (shape 0, at 0 0 0).  Windy Valley's
+// first entry (CAM0200S.BIN) is the same but for CAMMD_FOLLOW (0) and
+// adjust 1; that camera only got dragged along and never turned behind
+// the truck.
+static union { unsigned char b[128]; u32 count; } map_cam;
+static void map_cam_build(void)
+{
+    unsigned char *e = map_cam.b + 64;
+    map_cam.count = 1;
+    e[0] = 4;                            // scMode: CAMMD_KNUCKLES
+    e[1] = 0;                            // scPriority
+    e[2] = 19;                           // ucAdjType: CAMADJ_RELATIVE2C
+    e[3] = 0;                            // scColType
+    *(unsigned short *)(e + 4) = 18;     // xColAng
+    *(float *)(e + 28) = 400.0f;         // zColScl
+    *(float *)(e + 36) = 220.0f; *(float *)(e + 40) = 110.0f; *(float *)(e + 44) = 220.0f;  // xyzDirPos
+    *(float *)(e + 48) = 200.0f; *(float *)(e + 52) = 22.0f;  *(float *)(e + 56) = 220.0f;  // xyzCamPos
+}
+static float map_back[2][3];             // Sonic's and Tails' places in Station Square
+static int map_back_act, map_back_pending, map_going;
+static float map_hold;                   // seconds L + R held
+
+static void __cdecl map_files(void)
+{
+    ((void (__cdecl *)(int))0x4B4C70)(MAP_LEVEL);
+    ((void (__cdecl *)(int))0x4B4BF0)(MAP_LEVEL);
+    map_cam_build();
+    for (int i = 0; i < 7; i++) ((void **)0x3C58180)[i] = &map_cam;
+    *(unsigned char *)0x3ABDF68 = 1;
+    PrintDebug("[SADX Truck] map: level %d files: no objects, one camera (Station Square's)\n", MAP_LEVEL);
+}
+
+static void map_patch(void)
+{
+    // A 7-byte thunk: call map_files; pop esi; ret (the end of every case
+    // pops esi, pushed at the top of LoadLevelFiles).
+    unsigned char *th = VirtualAlloc(0, 16, 0x3000, 0x40);
+    u32 *entry = (u32 *)0x42380C, old;
+    if (!th || *entry != 0x4237D0u) {
+        PrintDebug("[SADX Truck] map: LoadLevelFiles entry for level %d is %u, not the freeze; left alone, no map level\n",
+                   MAP_LEVEL, *entry);
+        return;
+    }
+    th[0] = 0xE8; *(u32 *)(th + 1) = (u32)map_files - (u32)(th + 5);
+    th[5] = 0x5E; th[6] = 0xC3;
+    VirtualProtect(entry, 4, 0x40, &old);
+    *entry = (u32)th;
+    VirtualProtect(entry, 4, old, &old);
+    ((void **)0x97DA08)[MAP_LEVEL * 8] = &map_lt;
+    map_patched = 1;
+}
+
+// The map menu.  Station Square, on foot, L + R held 2 seconds opens it;
+// D-pad up / down picks, A goes, B closes.  While it is open the mod
+// blanks Sonic's buttons (OnControl, START stays) and the truck's on-foot
+// buttons (on_frame).  The names are SADX's debug text (SADXFunctions.h:
+// SetDebugFontSize 0x7808C0, SetDebugFontColor 0x7808E0, DisplayDebugString
+// 0x7808F0, position NJM_LOCATION(column, row) = column << 16 | row, in
+// characters), redrawn every frame.  The picture is the map's 64 x 64
+// overview (Cabela's COLORMAP\<MAP>.TGA), texture pack SXMAPMENU, texture
+// number 792256 + map.
+#define SetDebugFontSize ((void (__cdecl *)(unsigned short))0x7808C0)
+#define SetDebugFontColor ((void (__cdecl *)(int))0x7808E0)
+#define DisplayDebugString ((void (__cdecl *)(int, const char *))0x7808F0)
+#define MAP_MENU_GBIX0 792256u
+static int map_sel;
+static u32 map_menu_before;
+static nj_texname map_menu_texnames[16];
+static struct { nj_texname *textures; u32 n; } map_menu_texlist = { map_menu_texnames, 16 };
+static int map_menu_tex_tried;
+
+static void map_menu_open(u32 held)
+{
+    map_menu = 1;
+    map_sel = map_now >= 0 ? map_now : 0;
+    map_menu_before = held;              // L and R are still down: not presses
+    map_menu_tex_tried = 0;
+    make_rings();                        // its draw function draws the picture
+    PrintDebug("[SADX Truck] map: menu open\n");
+}
+
+static void map_go(int k)
+{
+    if (!map_have[k]) { PrintDebug("[SADX Truck] map: %s is not built (maps\\%s.bin)\n", map_names[k], map_ids[k]); return; }
+    if (!map_open(k)) return;
+    map_menu = 0;
+    map_going = 1;
+    for (int i = 0; i < 3; i++) map_back[0][i] = ((float *)(player_task + 32))[i];
+    if (player2_task) for (int i = 0; i < 3; i++) map_back[1][i] = ((float *)(player2_task + 32))[i];
+    else for (int i = 0; i < 3; i++) map_back[1][i] = map_back[0][i];
+    map_back_act = act_now;
+    PrintDebug("[SADX Truck] map: going to %s (level %d) from Station Square act %d\n", map_names[k], MAP_LEVEL, act_now);
+    SetNextLevelAndAct_CutsceneMode(MAP_LEVEL, 0);
+}
+
+// Each frame: 1 = the menu is open (its buttons are not Sonic's or the truck's).
+static int map_menu_frame(u32 held, int on_foot)
+{
+    if (!map_menu) return 0;
+    if (level_now != 26 || !on_foot) { map_menu = 0; PrintDebug("[SADX Truck] map: menu closed (left Station Square or got in)\n"); return 0; }
+    if (game_mode != 15) return 1;       // paused: the menu waits, not drawn
+    u32 press = held & ~map_menu_before;
+    map_menu_before = held;
+    if (press & BUTTON_UP) map_sel = (map_sel + 15) % 16;
+    if (press & BUTTON_DOWN) map_sel = (map_sel + 1) % 16;
+    if (press & BUTTON_B) { map_menu = 0; PrintDebug("[SADX Truck] map: menu closed\n"); return 1; }
+    if (press & BUTTON_A) { map_go(map_sel); if (!map_menu) return 1; }
+    // Text: rows of screen height / 30 (30 rows, 640 x 480 is 16 pixels).
+    int size = screen_h / 30;
+    if (size < 8) size = 8;
+    SetDebugFontSize((unsigned short)size);
+    SetDebugFontColor((int)0xFFFFFFFFu);
+    DisplayDebugString(3 << 16 | 3, "PICK A MAP");
+    for (int k = 0; k < 16; k++) {
+        static char line[16][40];
+        char *o = line[k];
+        const char *t = map_names[k];
+        *o++ = k == map_sel ? '>' : ' ';
+        *o++ = ' ';
+        while (*t) *o++ = *t++;
+        if (!map_have[k]) { t = "  (not built)"; while (*t) *o++ = *t++; }
+        *o = 0;
+        SetDebugFontColor((int)(k == map_sel ? 0xFFFFFF00u : map_have[k] ? 0xFFFFFFFFu : 0xFF808080u));
+        DisplayDebugString(3 << 16 | (5 + k), line[k]);
+    }
+    SetDebugFontColor((int)0xFFFFFFFFu);
+    DisplayDebugString(3 << 16 | 23, "D-pad up/down: pick   A: go   B: close");
+    return 1;
+}
+
+// The picked map's overview, right of the list, 3 times its size on a
+// 640 x 480 screen (192 x 192), found by its texture number.
+static void map_menu_picture(void)
+{
+    if (game_mode != 15) return;
+    int slot = -1;
+    for (int i = 0; i < 16; i++) {
+        const u32 *t = (const u32 *)map_menu_texnames[i].texaddr;
+        if (t && t[0] == MAP_MENU_GBIX0 + (u32)map_sel) slot = i;
+    }
+    if (slot < 0) {
+        if (map_menu_tex_tried) return;
+        map_menu_tex_tried = 1;
+        for (int i = 0; i < 16; i++) map_menu_texnames[i].texaddr = 0;
+        LoadPVM("SXMAPMENU", &map_menu_texlist);
+        PrintDebug("[SADX Truck] map: menu pictures SXMAPMENU %s\n", map_menu_texnames[0].texaddr ? "loaded" : "NOT loaded");
+        return;
+    }
+    static struct { short sx, sy, cx, cy, u1, v1, u2, v2, texid, attr; } anim;
+    static struct { float p[3], sx, sy; int ang; void *tlist, *tanim; } sprite;
+    anim.sx = 64; anim.sy = 64; anim.cx = 32; anim.cy = 32;
+    anim.u1 = 0; anim.v1 = 0; anim.u2 = 255; anim.v2 = 255;
+    anim.texid = (short)slot; anim.attr = 0;
+    sprite.p[0] = screen_w * 0.75f; sprite.p[1] = screen_h * 0.4f; sprite.p[2] = 0.0f;
+    sprite.sx = sprite.sy = stretch_2d * 3.0f;
+    sprite.ang = 0;
+    sprite.tlist = &map_menu_texlist; sprite.tanim = &anim;
+    SetMaterialAndSpriteColor_Float(1.0f, 1.0f, 1.0f, 1.0f);   // the same settings as draw_picture
+    njColorBlendingMode(0, 8);
+    njColorBlendingMode(1, 6);
+    njDrawSprite2D_ForcePriority(&sprite, 0, -1.5f, (1u << 5) | (1u << 4));
+    ResetMaterial();
+}
+
+static void map_frame(u32 held, int on_foot)
+{
+    if (!map_patched) return;
+    map_on = map_file && level_now == MAP_LEVEL && land_table == (char *)&map_lt;
+    if (map_on && !map_task) {
+        map_task = CreateElementalTask(0, 1, map_exec);
+        if (map_task) { *(void **)(map_task + 20) = (void *)map_draw; *(void **)(map_task + 24) = (void *)map_freed; }
+        map_tex_tried = 0;
+        map_going = 0;
+        float *sp = (float *)(player_task + 32);
+        PrintDebug("[SADX Truck] map: %s (level %d), Sonic at %.0f %.0f %.0f\n", map_names[map_now], MAP_LEVEL,
+                   (double)sp[0], (double)sp[1], (double)sp[2]);
+        // The start point is registered again for each map; if the Mod
+        // Loader kept an older one, put him at this map's start.
+        float dx = sp[0] - map_spawn[0], dz = sp[2] - map_spawn[2];
+        if (dx * dx + dz * dz > 100.0f * 100.0f) {
+            sp[0] = map_spawn[0]; sp[1] = map_spawn[1] + 10.0f; sp[2] = map_spawn[2];
+            PrintDebug("[SADX Truck] map: not at this map's start, moved there\n");
+        }
+    }
+    // View distance for the sky (see Sky, step 6): every frame on the map.
+    // DrawDistanceNegative (0x90082C, SADXVariables.h) logged once, to see
+    // what level 11 had.
+    if (map_on) {
+        static int told;
+        if (!told) {
+            told = 1;
+            PrintDebug("[SADX Truck] map: view distance was %.1f %.1f (DrawDistanceNegative), now near -1, far -%.0f\n",
+                       (double)((const float *)0x90082C)[0], (double)((const float *)0x90082C)[1], (double)SKY_CLIP);
+        }
+        njClipZ(-1.0f, -SKY_CLIP);
+        static int fog_told;
+        if (!fog_told) {
+            fog_told = 1;
+            PrintDebug("[SADX Truck] map: fog was %.0f to %.0f, color %08X, %s (from Station Square); now the map's\n",
+                       (double)gFog[0], (double)gFog[1], ((const u32 *)gFog)[2], ((const unsigned char *)gFog)[12] ? "on" : "off");
+        }
+        if (sky_fog) {
+            gFog[0] = -(sky_fog_start > 1.0f ? sky_fog_start : 1.0f);
+            gFog[1] = -sky_fog_end;
+            ((u32 *)gFog)[2] = sky_fog_color;
+            ((unsigned char *)gFog)[12] = 1;
+            njFogEnable();
+        } else {
+            ((unsigned char *)gFog)[12] = 0;
+            njFogDisable();
+        }
+    }
+    // Back in Station Square from the map: where Sonic left from.
+    if (level_now == 26 && map_back_pending && game_mode == 15) {
+        map_back_pending = 0;
+        map_going = 0;
+        for (int i = 0; i < 3; i++) ((float *)(player_task + 32))[i] = map_back[0][i];
+        if (player2_task) for (int i = 0; i < 3; i++) ((float *)(player2_task + 32))[i] = map_back[1][i];
+        PrintDebug("[SADX Truck] map: back in Station Square act %d at %.0f %.0f %.0f\n", act_now,
+                   (double)map_back[0][0], (double)map_back[0][1], (double)map_back[0][2]);
+    }
+    // Sonic and the walls: SADX lists the walls for him (0x43AEF0 takes
+    // every landtable piece within its radius + 400 of the player) but
+    // doesn't stop him with them; why is not known (the triangles are about
+    // 10,000 by 2,400 units, far bigger than any of SADX's own).  So on
+    // foot, past a wall, he is put back 10 units inside it.
+    if (map_on && on_foot) {
+        float *s = (float *)(player_task + 32);
+        float lo[2] = { map_edge[0] + 10.0f, map_edge[2] + 10.0f }, hi[2] = { map_edge[1] - 10.0f, map_edge[3] - 10.0f };
+        static int told;
+        int moved = 0;
+        for (int a = 0; a < 2; a++) {
+            float *v = &s[a * 2];
+            if (*v < lo[a]) { *v = lo[a]; moved = 1; }
+            if (*v > hi[a]) { *v = hi[a]; moved = 1; }
+        }
+        if (moved && !told) { told = 1; PrintDebug("[SADX Truck] map: Sonic stopped at the edge, %.0f %.0f %.0f\n", (double)s[0], (double)s[1], (double)s[2]); }
+        if (!moved) told = 0;
+    }
+    // Under the ground: on foot near the parked truck Sonic has sunk through
+    // the ground (seen once, standing beside it; probably the truck's solid
+    // boxes pushing him down, not proven).  The ground only stops things
+    // from above, so nothing caught him.  Cabela's maps have nothing under
+    // the ground, so more than 6 units (about 2 feet) under it, he is put
+    // back 1 unit above it with his speed stopped.
+    if (map_on && on_foot) {
+        float *s = (float *)(player_task + 32);
+        float g = map_ground_y(s[0], s[2]);
+        static int caught;
+        if (g != NO_GROUND && s[1] < g - 6.0f) {
+            if (!caught) {
+                const float *tp = truck ? (const float *)(*(const char *const *)((const char *)truck + 4) + 0x28) : 0;
+                PrintDebug("[SADX Truck] map: Sonic under the ground at %.0f %.0f %.0f (ground %.0f), put back on it; truck %s at %.0f %.0f %.0f\n",
+                           (double)s[0], (double)s[1], (double)s[2], (double)g, tp ? "parked" : "none",
+                           tp ? (double)(origin.x + tp[0] * UNITS_PER_METER) : 0.0, tp ? (double)(origin.y + tp[1] * UNITS_PER_METER) : 0.0,
+                           tp ? (double)(origin.z + tp[2] * UNITS_PER_METER) : 0.0);
+            }
+            caught = 1;
+            s[1] = g + 1.0f;
+            float *spd = (float *)(player_motion + 4);
+            spd[0] = spd[1] = spd[2] = 0;
+            spd = (float *)(player_work + 56);
+            spd[0] = spd[1] = spd[2] = 0;
+        } else caught = 0;
+    }
+    // Fall-out floor: off the map's edge or through the ground, Sonic goes
+    // back to the start point.
+    if (map_on && on_foot && ((float *)(player_task + 32))[1] < map_low - 500.0f) {
+        float *s = (float *)(player_task + 32);
+        PrintDebug("[SADX Truck] map: Sonic fell out at %.0f %.0f %.0f, back to the start\n", (double)s[0], (double)s[1], (double)s[2]);
+        s[0] = map_spawn[0]; s[1] = map_spawn[1] + 10.0f; s[2] = map_spawn[2];
+    }
+    // The truck too (driven or parked): below the same floor, it goes back
+    // to the start, facing +x, 1 meter (about 3 feet) up, still.  have_prev
+    // = 0 so the sudden stop isn't taken for a crash.
+    if (map_on && truck) {
+        const float *tp = (const float *)(*(const char *const *)((const char *)truck + 4) + 0x28);
+        if (origin.y + tp[1] * UNITS_PER_METER < map_low - 500.0f) {
+            PrintDebug("[SADX Truck] map: truck fell out at %.0f %.0f %.0f, back to the start\n",
+                       (double)(origin.x + tp[0] * UNITS_PER_METER), (double)(origin.y + tp[1] * UNITS_PER_METER),
+                       (double)(origin.z + tp[2] * UNITS_PER_METER));
+            origin.x = map_spawn[0]; origin.y = map_spawn[1]; origin.z = map_spawn[2];
+            float rot[9] = { 0, 0, -1,   0, 1, 0,   1, 0, 0 };
+            SetOrientation(truck, rot);
+            tVect3 start = { 0.0f, 1.0f, 0.0f };
+            SetPosition(truck, &start);
+            SetLinearSpeed(truck, 0, 0, 0);
+            SetAngularSpeed(truck, 0, 0, 0);
+            landed = lost_ground = 0;
+            have_prev = 0;
+        }
+    }
+    if (!map_going && on_foot && (map_on || level_now == 26) && game_mode == 15 && (held & BUTTON_L) && (held & BUTTON_R)) {
+        float before = map_hold;
+        map_hold += 1.0f / 60.0f;
+        if (before < 2.0f && map_hold >= 2.0f) {
+            if (!map_on) {
+                map_menu_open(held);
+            } else {
+                map_going = 1;
+                map_back_pending = 1;
+                PrintDebug("[SADX Truck] map: going back to Station Square act %d\n", map_back_act);
+                SetNextLevelAndAct_CutsceneMode(26, (unsigned char)map_back_act);
+            }
+        }
+    } else map_hold = 0;
+}
+#endif
 
 static void on_frame(void)
 {
@@ -4209,6 +5917,9 @@ static void on_frame(void)
     }
     u32 held = *(const u32 *)(pad_raw + 8);
     if (game_mode != 15) held = 0;      // paused: the pause menu's buttons are not the truck's
+#ifndef TEST_EXE
+    if (map_menu_frame(held, !riding)) { held = 0; held_before = 0; }   // the map menu's buttons
+#endif
     int y_pressed = (held & BUTTON_Y) && !(held_before & BUTTON_Y);
     // Better Tails AI moved Tails beside Sonic after getting out: back to
     // his door (see btai_loaded).
@@ -4246,6 +5957,9 @@ static void on_frame(void)
                        trucks[picked].name, sname[s], (double)(0.1f + (s == 1 ? 0.6f : s == 2 ? 1.0f : 0.0f)));
         }
     }
+#ifndef TEST_EXE
+    map_frame(held, !riding);
+#endif
     // Repair the picked truck's engine: on foot, D-pad up held 2 seconds.
     if (!riding && (held & BUTTON_UP)) {
         repair_t += 1.0f / 60.0f;

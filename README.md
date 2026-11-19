@@ -3,9 +3,11 @@
 Drive the trucks from **Cabela's 4x4 Off-Road Adventure 3** in **Sonic Adventure DX** (PC).
 The mod runs Cabela's own truck physics engine (`EngineDll.dll`) inside SADX: all 14 trucks,
 with their engine sounds, gears, fuel, part damage, dents and snorkels.
+It also brings Cabela's 16 maps into SADX, with their rocks, trees, grass, buildings, bridges,
+ramps, water, sky and fog; Sonic and the trucks can go to any of them from Station Square.
 
 This repository holds only the mod's own code. No Cabela's files are in it.
-You bring your own copy of Cabela's 3, and `setup.exe` builds the truck data from it on your PC.
+You bring your own copy of Cabela's 3, and `setup.exe` builds the truck and map data from it on your PC.
 
 ## What you need
 
@@ -40,6 +42,9 @@ SADX Truck\
   trucks.bin                    the 14 trucks: models, sounds list, tuning
   sounds\                       88 sounds
   textures\SADXTRUCK\           90 textures, including the truck picker pictures
+  maps\                         the 16 Cabela's maps: ground, objects, collision, grass, sky
+  textures\SXMAP_*, SXOBJ_*,     the maps' pictures (ground, objects, sky),
+    SXSKY_*, SXWATER, SXMAPMENU   the water and the map menu
   setup_log.txt                 what setup found and wrote
 ```
 
@@ -57,6 +62,10 @@ setup.exe "<Cabela's 3 folder>" "<Enhancement Pack zip>" ["<Cabela's 1 folder>"]
 | on foot | D-pad left / right | pick the previous / next truck (its picture shows for 2 seconds) |
 | on foot | D-pad down | snorkel for the picked truck: none, Watermaster, Watermaster Ultra |
 | on foot | D-pad up, hold 2 seconds | repair the picked truck and fill its tank |
+| on foot in Station Square | L + R, hold 2 seconds | open the map menu |
+| map menu | D-pad up / down | pick a map (its overview picture shows) |
+| map menu | A / B | go to the picked map / close the menu |
+| on foot on a map | L + R, hold 2 seconds | back to Station Square, where Sonic left from |
 | driving | X | crank the engine (in Ice Cap, hold it) |
 | driving | R or A or right trigger | gas |
 | driving | L or B or left trigger | brake; held while stopped, it shifts into reverse |
@@ -116,6 +125,8 @@ lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console sadxtruck/testho
 | `res_list.py` | list Cabela's 1 `data1.res` |
 | `model_bones.py` | print a truck model's parts and bones |
 | `heightmap_to_obj.py`, `colormap_to_png.py` | turn a Cabela's map into a 3D model and a picture |
+| `map_to_bin.py` | the Python version of what `setup.exe` does for the maps (`setup/maps.c`); the two give identical files |
+| `map_to_obj.py` | one Cabela's map's ground as an OBJ model and picture, for looking at in Blender; `map_to_bin.py` uses its readers |
 | `truckprobe/truckprobe.c` | the first experiment: loads Cabela's engine on its own and drives one truck |
 
 ## License

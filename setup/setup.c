@@ -25,7 +25,9 @@
 // without it its 5 starter-crank sounds are written as silence of the
 // same lengths.
 // Step 4: the texture pack textures\SADXTRUCK (textures.c, 90 PNGs).
-// Step 5: message boxes, pickers and the log (this file's main part).
+// Step 5: Cabela's 16 maps (maps.c, the C copy of map_to_bin.py): maps\
+// (ground, objects, collision, grass, sky files) and their texture packs.
+// Step 6: message boxes, pickers and the log (this file's main part).
 //
 // Build (from ProjectSADXTruck):
 //   clang --target=i686-pc-windows-msvc -O1 -msse2 -mfpmath=sse -fno-math-errno -fno-builtin -fno-stack-protector -mno-stack-arg-probe -c setup/setup.c -o setup/setup.obj
@@ -500,6 +502,7 @@ static int args(char out[][300])
 
 #include "trucks_bin.c"
 #include "textures.c"
+#include "maps.c"
 
 void __cdecl start(void)
 {
@@ -629,17 +632,20 @@ void __cdecl start(void)
     printf("\nwriting the texture pack\n");
     write_textures(mod_dir);
     printf("wrote %d textures and index.txt into %s\n", tex_count, tex_dir);
+    printf("\nbuilding the maps\n");
+    write_maps();
+    printf("wrote %d maps into %s\\maps\n", maps_written, mod_dir);
     if (inexact) printf("  WARNING: %d numbers may be off in their last digit.\n", inexact);
     printf("\nsetup done\n");
     write_log();
     if (gui) {
         char b[800];
         sprintf(b, "SADX Truck is set up.\n\n"
-                   "14 trucks, %d sounds, %d textures.\n"
+                   "14 trucks, %d sounds, %d textures, %d of Cabela's maps.\n"
                    "Starter cranking sounds: %s\n\n"
                    "Turn on SADX Truck in SA Mod Manager and play. "
                    "(Run setup.exe again any time; it rebuilds the same files.)",
-                sounds_written, tex_count, cabelas1[0] ? "from the first Cabela's 4x4." : "silent (the first Cabela's 4x4 wasn't used).");
+                sounds_written, tex_count, maps_written, cabelas1[0] ? "from the first Cabela's 4x4." : "silent (the first Cabela's 4x4 wasn't used).");
         box(b, MB_OK | MB_ICONINFORMATION);
     }
     ExitProcess(0);
