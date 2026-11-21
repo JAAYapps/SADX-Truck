@@ -4242,6 +4242,21 @@ static short map_uv[16][MAP_CORNERS][2]; // by the block's place inside its pict
 static nj_meshset map_sets[MAP_BLOCKS];
 static nj_model map_models[MAP_BLOCKS];
 static nj_object map_objs[MAP_BLOCKS];
+// Collision: each block's ground as 4 pieces of 16 x 16 cells (512
+// triangles), each with its own 17 x 17 points.  A whole block (2048
+// triangles) lost its ground in places, only ever in its second half
+// (rows 16 to 31, triangle 1024 on), so SADX seems to handle only about
+// 1024 triangles of one piece (seen in the log's grid check, not found in
+// sonic.exe's code).  Drawing still uses the whole blocks above.
+#define MAP_QCELLS (MAP_CELLS / 2)
+#define MAP_QNP (MAP_QCELLS + 1)
+#define MAP_QPTS (MAP_QNP * MAP_QNP)
+#define MAP_COLS (MAP_BLOCKS * 4 + 4)    // collision pieces: 4 per block, then the 4 walls
+static short map_qtris[MAP_QCELLS * MAP_QCELLS * 6];
+static float map_qpts[MAP_BLOCKS * 4][MAP_QPTS * 3], map_qnrm[MAP_BLOCKS * 4][MAP_QPTS * 3];
+static nj_meshset map_qsets[MAP_BLOCKS * 4];
+static nj_model map_qmodels[MAP_BLOCKS * 4];
+static nj_object map_qobjs[MAP_BLOCKS * 4];
 static short map_far_tris[MAP_FAR_CORNERS];         // far blocks: same points, fewer triangles
 static short map_far_uv[16][MAP_FAR_CORNERS][2];
 static nj_meshset map_far_sets[MAP_BLOCKS];
@@ -4267,7 +4282,7 @@ static nj_model map_det_models[MAP_BLOCKS];
 #define NJ_BLEND_TABLE ((u32 *)0x88AE1C)
 static int map_det_table_ok;             // 1 = writable, -1 = VirtualProtect failed (no detail)
 typedef struct { float c[3], r, wy, wz; void *obj; int blockbits, flags; } map_col;
-static map_col map_cols_base[MAP_BLOCKS + 4];  // ground blocks, then the 4 walls
+static map_col map_cols_base[MAP_COLS];        // ground quarter blocks, then the 4 walls
 static map_col *map_cols = map_cols_base;       // that, or a longer copy with the rocks' shapes after it
 // Invisible walls along the map's 4 edges (collision only): a flat
 // upright rectangle each, 2 triangles, facing in.
@@ -4368,7 +4383,7 @@ static void map_walls(unsigned char *b)
         nj_object *o = &map_wall_objs[w];
         o->eval = (1u << 0) | (1u << 1) | (1u << 2);
         o->model = md; o->scl[0] = o->scl[1] = o->scl[2] = 1.0f;
-        int k2 = MAP_BLOCKS + w;
+        int k2 = MAP_BLOCKS * 4 + w;
         map_cols[k2].c[0] = c[0]; map_cols[k2].c[1] = c[1]; map_cols[k2].c[2] = c[2]; map_cols[k2].r = r;
         map_cols[k2].obj = o;
         map_cols[k2].flags = 1 << 0;                    // solid, not drawn
@@ -4484,6 +4499,14 @@ static int map_open(int k)
             const short q[6] = { a, bb, c, bb, d, c };
             for (int e = 0; e < 6; e++) map_tris[t++] = q[e];
         }
+    // The same for a quarter block's 17 x 17 points (collision).
+    t = 0;
+    for (int i = 0; i < MAP_QCELLS; i++)
+        for (int j = 0; j < MAP_QCELLS; j++) {
+            short a = (short)(i * MAP_QNP + j), bb = (short)(a + 1), c = (short)(a + MAP_QNP), d = (short)(c + 1);
+            const short q[6] = { a, bb, c, bb, d, c };
+            for (int e = 0; e < 6; e++) map_qtris[t++] = q[e];
+        }
     // Far blocks: the same 33 x 33 points, cells of 4 x 4 (1/16 of the triangles).
     t = 0;
     for (int i = 0; i < MAP_CELLS; i += MAP_FAR_STEP)
@@ -4553,12 +4576,39 @@ static int map_open(int k)
         nj_object *o = &map_objs[k2];
         o->eval = (1u << 0) | (1u << 1) | (1u << 2);   // don't move, turn or scale
         o->model = md; o->scl[0] = o->scl[1] = o->scl[2] = 1.0f;
-        map_cols[k2].c[0] = c[0]; map_cols[k2].c[1] = c[1]; map_cols[k2].c[2] = c[2]; map_cols[k2].r = c[3];
-        map_cols[k2].obj = o;
-        map_cols[k2].flags = 1 << 0;                    // solid, not drawn by SADX
+        // Collision: 4 quarter pieces (see MAP_QCELLS), quarter (qi, qj) =
+        // cell rows qi * 16 to qi * 16 + 15 and columns qj * 16 on.
+        for (int qi = 0; qi < 2; qi++)
+            for (int qj = 0; qj < 2; qj++) {
+                int k4 = k2 * 4 + qi * 2 + qj;
+                float *qp = map_qpts[k4], *qn = map_qnrm[k4];
+                float lo[3], hi[3];
+                for (int i = 0; i < MAP_QNP; i++)
+                    for (int j = 0; j < MAP_QNP; j++) {
+                        int from = ((qi * MAP_QCELLS + i) * MAP_NP + qj * MAP_QCELLS + j) * 3, to = (i * MAP_QNP + j) * 3;
+                        for (int e = 0; e < 3; e++) {
+                            qp[to + e] = pts[from + e]; qn[to + e] = nrm[from + e];
+                            if ((i == 0 && j == 0) || qp[to + e] < lo[e]) lo[e] = qp[to + e];
+                            if ((i == 0 && j == 0) || qp[to + e] > hi[e]) hi[e] = qp[to + e];
+                        }
+                    }
+                float qc[3], r2 = 0;
+                for (int e = 0; e < 3; e++) { qc[e] = (lo[e] + hi[e]) / 2; r2 += (hi[e] - qc[e]) * (hi[e] - qc[e]); }
+                float qr = sqrt_f(r2);
+                nj_meshset *qs = &map_qsets[k4];
+                *qs = *s; qs->n = MAP_QCELLS * MAP_QCELLS * 2; qs->meshes = map_qtris; qs->uv = 0; qs->buffer = 0;
+                nj_model *qm = &map_qmodels[k4];
+                *qm = *md; qm->points = qp; qm->normals = qn; qm->npoints = MAP_QPTS; qm->sets = qs;
+                qm->center[0] = qc[0]; qm->center[1] = qc[1]; qm->center[2] = qc[2]; qm->r = qr;
+                nj_object *qo = &map_qobjs[k4];
+                *qo = *o; qo->model = qm;
+                map_cols[k4].c[0] = qc[0]; map_cols[k4].c[1] = qc[1]; map_cols[k4].c[2] = qc[2]; map_cols[k4].r = qr;
+                map_cols[k4].obj = qo;
+                map_cols[k4].flags = 1 << 0;            // solid, not drawn by SADX
+            }
     }
     map_walls(b);
-    map_lt.ncol = MAP_BLOCKS + 4; map_lt.col = map_cols;
+    map_lt.ncol = MAP_COLS; map_lt.col = map_cols;
     map_lt.clip = MAP_DRAW; map_lt.texlist = &map_texlist;
     // Sonic's (and every character's) start in level 11 act 0, through the
     // Mod Loader (HelperFunctions: Version, then RegisterStartPosition).
@@ -4699,7 +4749,7 @@ static void obj_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *
     u32 need = nm * sizeof(obj_model) + nmesh * (sizeof(nj_model) + sizeof(nj_meshset) + sizeof(nj_material))
              + np * sizeof(obj_place)
              + obj_ncols * (sizeof(nj_model) + sizeof(nj_meshset) + sizeof(nj_object)) + ncolpt * 24
-             + (MAP_BLOCKS + 4 + obj_ncols) * sizeof(map_col) + 64;
+             + (MAP_COLS + obj_ncols) * sizeof(map_col) + 64;
     unsigned char *a = VirtualAlloc(0, need, 0x3000, 4);
     if (!a) { PrintDebug("[SADX Truck] map: no memory for the rocks and plants (%u bytes)\n", need); return; }
     obj_arena = a;
@@ -4747,9 +4797,9 @@ static void obj_load(int k, void *(__stdcall *cf)(const char *, u32, u32, void *
     }
     obj_nmodels = nm; obj_nmeshes = nmesh;
     // Landtable: the fixed part, then one piece per copy with a shape.
-    map_col *cols = (map_col *)a; a += (MAP_BLOCKS + 4 + obj_ncols) * sizeof(map_col);
-    for (int i = 0; i < MAP_BLOCKS + 4; i++) cols[i] = map_cols_base[i];
-    int ci = MAP_BLOCKS + 4;
+    map_col *cols = (map_col *)a; a += (MAP_COLS + obj_ncols) * sizeof(map_col);
+    for (int i = 0; i < MAP_COLS; i++) cols[i] = map_cols_base[i];
+    int ci = MAP_COLS;
     // Pass 3: copies.
     for (int j = 0; j < np; j++) {
         const unsigned char *q = pstart + j * 52;
@@ -5372,6 +5422,20 @@ static float map_ground_y(float x, float z)
     return yd + (yc - yd) * (1.0f - fj) + (yb - yd) * (1.0f - fi);
 }
 
+// Which ground block (row bz, column bx) and which cell inside it (row i,
+// column j, 0 to 31) a point is over; 0 off the map.  The same steps as
+// map_ground_y.  (Testing: the ground check's grid.)
+static int map_cell(float x, float z, int *bz, int *bx, int *i, int *j)
+{
+    if (!map_file) return 0;
+    const float *p0 = (const float *)(map_file + 64 + 20);
+    float gc = (x - p0[0]) / (p0[3] - p0[0]), gr = (z - p0[2]) / (p0[MAP_NP * 3 + 2] - p0[2]);
+    if (gc < 0 || gr < 0 || gc >= MAP_NB * MAP_CELLS || gr >= MAP_NB * MAP_CELLS) return 0;
+    int c = (int)gc, r = (int)gr;
+    *bx = c / MAP_CELLS; *bz = r / MAP_CELLS; *j = c - *bx * MAP_CELLS; *i = r - *bz * MAP_CELLS;
+    return 1;
+}
+
 static u32 gr_hash(int a, int b, int c)
 {
     u32 h = (u32)a * 73856093u ^ (u32)b * 19349663u ^ (u32)c * 83492791u;
@@ -5846,8 +5910,10 @@ static void map_frame(u32 held, int on_foot)
         if (g != NO_GROUND && s[1] < g - 6.0f) {
             if (!caught) {
                 const float *tp = truck ? (const float *)(*(const char *const *)((const char *)truck + 4) + 0x28) : 0;
-                PrintDebug("[SADX Truck] map: Sonic under the ground at %.0f %.0f %.0f (ground %.0f), put back on it; truck %s at %.0f %.0f %.0f\n",
-                           (double)s[0], (double)s[1], (double)s[2], (double)g, tp ? "parked" : "none",
+                int ang[3];
+                float sadx_g = GetShadowPos(s[0], g + 20.0f, s[2], ang);
+                PrintDebug("[SADX Truck] map: Sonic under the ground at %.0f %.0f %.0f (ground %.0f, SADX collision %.0f), put back on it; truck %s at %.0f %.0f %.0f\n",
+                           (double)s[0], (double)s[1], (double)s[2], (double)g, (double)sadx_g, tp ? "parked" : "none",
                            tp ? (double)(origin.x + tp[0] * UNITS_PER_METER) : 0.0, tp ? (double)(origin.y + tp[1] * UNITS_PER_METER) : 0.0,
                            tp ? (double)(origin.z + tp[2] * UNITS_PER_METER) : 0.0);
             }
@@ -5858,6 +5924,107 @@ static void map_frame(u32 held, int on_foot)
             spd = (float *)(player_work + 56);
             spd[0] = spd[1] = spd[2] = 0;
         } else caught = 0;
+    }
+    // Camera under the ground: SADX's camera collision (0x462B40) pushes a
+    // ball of radius 8 out of the ground at the camera's spot, so a camera
+    // that drops more than about 8 units (2 1/2 feet) under in one step, on
+    // a steep hill, stays under.  On a map, every frame: below the drawn
+    // ground plus 6 units (about 2 feet), lift it to there.  Logged once a
+    // second at most.
+    if (map_on && camera_twp) {
+        float *c = (float *)(camera_twp + 32);
+        float g = map_ground_y(c[0], c[2]);
+        static int lift_frames, lifts;
+        if (g != NO_GROUND && c[1] < g + 6.0f) {
+            c[1] = g + 6.0f;
+            lifts++;
+        }
+        if (++lift_frames >= 60) {
+            if (lifts) PrintDebug("[SADX Truck] map: camera lifted above the ground in %d of the last 60 frames\n", lifts);
+            lift_frames = lifts = 0;
+        }
+    }
+    // Ground check (testing, to take out later): once a second on a map,
+    // compare the drawn ground with SADX's own collision (GetShadowPos)
+    // under Sonic and under the camera, and log only what is off: Sonic or
+    // SADX's collision more than 3 units (about 1 foot) from the drawn
+    // ground, or the camera below it.  A rock or tree within 20 units
+    // (about 6 1/2 feet) above the ground also shows as "SADX collision"
+    // higher than the ground.
+    if (map_on) {
+        static int check_frames;
+        if (++check_frames >= 60) {
+            check_frames = 0;
+            int ang[3];
+            if (on_foot) {
+                const float *s = (const float *)(player_task + 32);
+                float g = map_ground_y(s[0], s[2]);
+                if (g != NO_GROUND) {
+                    float sg = GetShadowPos(s[0], g + 20.0f, s[2], ang);
+                    if (sg < g - 3.0f || sg > g + 3.0f || s[1] < g - 3.0f)
+                        PrintDebug("[SADX Truck] ground check: Sonic at %.0f %.0f %.0f, drawn ground %.0f, SADX collision %.0f\n",
+                                   (double)s[0], (double)s[1], (double)s[2], (double)g, (double)sg);
+                }
+                // A 9 x 9 grid of spots 10 units (about 3 feet) apart around
+                // Sonic: where SADX finds no ground at all (or more than 3
+                // units under the drawn ground), log the spot's block and its
+                // cell inside the block (row and column, 0 to 31).
+                char list[600];
+                int n = 0, missing = 0;
+                for (int gz = -4; gz <= 4; gz++)
+                    for (int gx = -4; gx <= 4; gx++) {
+                        float x = s[0] + gx * 10.0f, z = s[2] + gz * 10.0f;
+                        float gg = map_ground_y(x, z);
+                        int bz, bx, ci, cj;
+                        if (gg == NO_GROUND || !map_cell(x, z, &bz, &bx, &ci, &cj)) continue;
+                        if (GetShadowPos(x, gg + 20.0f, z, ang) >= gg - 3.0f) continue;
+                        missing++;
+                        if (n < 540) {
+                            const char *fmt = " [%d,%d row %d col %d]";
+                            int v[4] = { bz, bx, ci, cj }, k = 0;
+                            for (const char *f = fmt; *f && n < 590; f++) {
+                                if (f[0] == '%' && f[1] == 'd') {
+                                    int x2 = v[k++], d = 1;
+                                    if (x2 < 0) { list[n++] = '-'; x2 = -x2; }
+                                    while (x2 / d >= 10) d *= 10;
+                                    for (; d; d /= 10) list[n++] = (char)('0' + x2 / d % 10);
+                                    f++;
+                                } else list[n++] = *f;
+                            }
+                        }
+                    }
+                list[n] = 0;
+                if (missing)
+                    PrintDebug("[SADX Truck] ground check: grid around Sonic at %.0f %.0f: %d of 81 spots have no SADX ground:%s\n",
+                               (double)s[0], (double)s[2], missing, list);
+            }
+            if (camera_twp) {
+                const float *c = (const float *)(camera_twp + 32);
+                float g = map_ground_y(c[0], c[2]);
+                if (g != NO_GROUND && c[1] < g) {
+                    float sg = GetShadowPos(c[0], g + 20.0f, c[2], ang);
+                    // SADX's camera collision (CameraCollisitonCheck 0x462B40):
+                    // 0x436750 says whether to skip it; 0x4370C0 sweeps a
+                    // sphere (radius 8) from a start point along a vector,
+                    // shortening the vector on a hit; after a hit, the words at
+                    // 0x3B0E808 and 0x3B0E80A must each be 128 or less, or the
+                    // camera is only pulled in.  The same calls here, from 10
+                    // units (about 3 feet) above Sonic toward the camera.
+                    int skip = ((int (__cdecl *)(void))0x436750)();
+                    const float *s = (const float *)(player_task + 32);
+                    float from[3] = { s[0], s[1] + 10.0f, s[2] };
+                    float dir[3] = { c[0] - from[0], c[1] - from[1], c[2] - from[2] };
+                    float len0 = sqrt_f(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    int hit = ((int (__cdecl *)(float *, float *, int, float))0x4370C0)(from, dir, 0, 8.0f);
+                    float len1 = sqrt_f(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    PrintDebug("[SADX Truck] ground check: camera at %.0f %.0f %.0f, under the drawn ground %.0f, SADX collision %.0f; "
+                               "skip-check %d, sweep %s (%.0f of %.0f units), values %u %u\n",
+                               (double)c[0], (double)c[1], (double)c[2], (double)g, (double)sg,
+                               skip, hit ? "HIT" : "miss", (double)len1, (double)len0,
+                               *(const unsigned short *)0x3B0E808, *(const unsigned short *)0x3B0E80A);
+                }
+            }
+        }
     }
     // Fall-out floor: off the map's edge or through the ground, Sonic goes
     // back to the start point.

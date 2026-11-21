@@ -129,9 +129,22 @@ lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console sadxtruck/testho
 | `map_to_obj.py` | one Cabela's map's ground as an OBJ model and picture, for looking at in Blender; `map_to_bin.py` uses its readers |
 | `truckprobe/truckprobe.c` | the first experiment: loads Cabela's engine on its own and drives one truck |
 
+## Credits
+
+| Who | What |
+|---|---|
+| Joshua Vanderzee | the mod's idea and design choices, testing |
+| Claude, by Anthropic (https://claude.ai) | wrote most of the code (the mod, `setup.exe` and the Python tools), with me directing it and testing every step |
+| FUNLabs and Activision Value | Cabela's 4x4 Off-Road Adventure 3, whose trucks, physics engine, sounds and maps the mod uses from your own copy (none are included here) |
+| Mark Adler | `puff`, the base of `setup.exe`'s unzip code (see `THIRD_PARTY_NOTICES.md`) |
+| Pillow's authors | the picture-resize code in `setup/textures.c` (see `THIRD_PARTY_NOTICES.md`) |
+| X-Hax (SA Mod Manager and the SADX Mod Loader) | the mod loader, and the SDK headers the mod's SADX addresses come from |
+| unshield | how InstallShield cabinets are laid out: `setup.exe` reads the Enhancement Pack's cabinet the way unshield 1.6.2 does |
+
 ## License
 
-The mod's code is under the MIT License (see `LICENSE`). That covers only this repository's
+The mod's code is under the MIT License (see `LICENSE`), except the two adapted parts listed in
+`THIRD_PARTY_NOTICES.md`, which keep their own licenses. That covers only this repository's
 own code; Cabela's files that `setup.exe` reads or writes on your PC stay under their owners' terms.
 
 Cabela's 4x4 Off-Road Adventure is a trademark of its owners. Sonic Adventure DX is a trademark of SEGA.

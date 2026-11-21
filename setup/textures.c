@@ -85,7 +85,14 @@ static struct img mirror_lr(const struct img *a)
 }
 
 // ---------------------------------------------------------------- resize
-// Pillow's Image.resize(size, LANCZOS) for RGBA.
+// Pillow's Image.resize(size, LANCZOS) for RGBA: sinc(), lanczos(),
+// coeffs(), clip8(), pass() and resize() are a C copy of Pillow's
+// src/libImaging/Resample.c (precompute_coeffs, the 22-bit fixed point
+// passes), changed to this file's picture type.  Pillow is under the
+// MIT-CMU License: Copyright (c) 1997-2011 by Secret Labs AB, Copyright (c)
+// 1995-2011 by Fredrik Lundh and contributors, Copyright (c) 2010 by
+// Jeffrey 'Alex' Clark and contributors.  The full notice is in
+// THIRD_PARTY_NOTICES.md.
 
 #define PRECISION_BITS (32 - 8 - 2)
 #define PI 3.14159265358979323846
