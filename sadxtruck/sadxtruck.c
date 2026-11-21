@@ -5422,20 +5422,6 @@ static float map_ground_y(float x, float z)
     return yd + (yc - yd) * (1.0f - fj) + (yb - yd) * (1.0f - fi);
 }
 
-// Which ground block (row bz, column bx) and which cell inside it (row i,
-// column j, 0 to 31) a point is over; 0 off the map.  The same steps as
-// map_ground_y.  (Testing: the ground check's grid.)
-static int map_cell(float x, float z, int *bz, int *bx, int *i, int *j)
-{
-    if (!map_file) return 0;
-    const float *p0 = (const float *)(map_file + 64 + 20);
-    float gc = (x - p0[0]) / (p0[3] - p0[0]), gr = (z - p0[2]) / (p0[MAP_NP * 3 + 2] - p0[2]);
-    if (gc < 0 || gr < 0 || gc >= MAP_NB * MAP_CELLS || gr >= MAP_NB * MAP_CELLS) return 0;
-    int c = (int)gc, r = (int)gr;
-    *bx = c / MAP_CELLS; *bz = r / MAP_CELLS; *j = c - *bx * MAP_CELLS; *i = r - *bz * MAP_CELLS;
-    return 1;
-}
-
 static u32 gr_hash(int a, int b, int c)
 {
     u32 h = (u32)a * 73856093u ^ (u32)b * 19349663u ^ (u32)c * 83492791u;
@@ -5942,88 +5928,6 @@ static void map_frame(u32 held, int on_foot)
         if (++lift_frames >= 60) {
             if (lifts) PrintDebug("[SADX Truck] map: camera lifted above the ground in %d of the last 60 frames\n", lifts);
             lift_frames = lifts = 0;
-        }
-    }
-    // Ground check (testing, to take out later): once a second on a map,
-    // compare the drawn ground with SADX's own collision (GetShadowPos)
-    // under Sonic and under the camera, and log only what is off: Sonic or
-    // SADX's collision more than 3 units (about 1 foot) from the drawn
-    // ground, or the camera below it.  A rock or tree within 20 units
-    // (about 6 1/2 feet) above the ground also shows as "SADX collision"
-    // higher than the ground.
-    if (map_on) {
-        static int check_frames;
-        if (++check_frames >= 60) {
-            check_frames = 0;
-            int ang[3];
-            if (on_foot) {
-                const float *s = (const float *)(player_task + 32);
-                float g = map_ground_y(s[0], s[2]);
-                if (g != NO_GROUND) {
-                    float sg = GetShadowPos(s[0], g + 20.0f, s[2], ang);
-                    if (sg < g - 3.0f || sg > g + 3.0f || s[1] < g - 3.0f)
-                        PrintDebug("[SADX Truck] ground check: Sonic at %.0f %.0f %.0f, drawn ground %.0f, SADX collision %.0f\n",
-                                   (double)s[0], (double)s[1], (double)s[2], (double)g, (double)sg);
-                }
-                // A 9 x 9 grid of spots 10 units (about 3 feet) apart around
-                // Sonic: where SADX finds no ground at all (or more than 3
-                // units under the drawn ground), log the spot's block and its
-                // cell inside the block (row and column, 0 to 31).
-                char list[600];
-                int n = 0, missing = 0;
-                for (int gz = -4; gz <= 4; gz++)
-                    for (int gx = -4; gx <= 4; gx++) {
-                        float x = s[0] + gx * 10.0f, z = s[2] + gz * 10.0f;
-                        float gg = map_ground_y(x, z);
-                        int bz, bx, ci, cj;
-                        if (gg == NO_GROUND || !map_cell(x, z, &bz, &bx, &ci, &cj)) continue;
-                        if (GetShadowPos(x, gg + 20.0f, z, ang) >= gg - 3.0f) continue;
-                        missing++;
-                        if (n < 540) {
-                            const char *fmt = " [%d,%d row %d col %d]";
-                            int v[4] = { bz, bx, ci, cj }, k = 0;
-                            for (const char *f = fmt; *f && n < 590; f++) {
-                                if (f[0] == '%' && f[1] == 'd') {
-                                    int x2 = v[k++], d = 1;
-                                    if (x2 < 0) { list[n++] = '-'; x2 = -x2; }
-                                    while (x2 / d >= 10) d *= 10;
-                                    for (; d; d /= 10) list[n++] = (char)('0' + x2 / d % 10);
-                                    f++;
-                                } else list[n++] = *f;
-                            }
-                        }
-                    }
-                list[n] = 0;
-                if (missing)
-                    PrintDebug("[SADX Truck] ground check: grid around Sonic at %.0f %.0f: %d of 81 spots have no SADX ground:%s\n",
-                               (double)s[0], (double)s[2], missing, list);
-            }
-            if (camera_twp) {
-                const float *c = (const float *)(camera_twp + 32);
-                float g = map_ground_y(c[0], c[2]);
-                if (g != NO_GROUND && c[1] < g) {
-                    float sg = GetShadowPos(c[0], g + 20.0f, c[2], ang);
-                    // SADX's camera collision (CameraCollisitonCheck 0x462B40):
-                    // 0x436750 says whether to skip it; 0x4370C0 sweeps a
-                    // sphere (radius 8) from a start point along a vector,
-                    // shortening the vector on a hit; after a hit, the words at
-                    // 0x3B0E808 and 0x3B0E80A must each be 128 or less, or the
-                    // camera is only pulled in.  The same calls here, from 10
-                    // units (about 3 feet) above Sonic toward the camera.
-                    int skip = ((int (__cdecl *)(void))0x436750)();
-                    const float *s = (const float *)(player_task + 32);
-                    float from[3] = { s[0], s[1] + 10.0f, s[2] };
-                    float dir[3] = { c[0] - from[0], c[1] - from[1], c[2] - from[2] };
-                    float len0 = sqrt_f(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-                    int hit = ((int (__cdecl *)(float *, float *, int, float))0x4370C0)(from, dir, 0, 8.0f);
-                    float len1 = sqrt_f(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-                    PrintDebug("[SADX Truck] ground check: camera at %.0f %.0f %.0f, under the drawn ground %.0f, SADX collision %.0f; "
-                               "skip-check %d, sweep %s (%.0f of %.0f units), values %u %u\n",
-                               (double)c[0], (double)c[1], (double)c[2], (double)g, (double)sg,
-                               skip, hit ? "HIT" : "miss", (double)len1, (double)len0,
-                               *(const unsigned short *)0x3B0E808, *(const unsigned short *)0x3B0E80A);
-                }
-            }
         }
     }
     // Fall-out floor: off the map's edge or through the ground, Sonic goes
