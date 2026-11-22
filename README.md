@@ -27,7 +27,7 @@ pack's installer (it is a 16-bit program and will not start on 64-bit Windows);
 
 1. Download `SADX-Truck.zip` from the [Releases page](https://github.com/JAAYapps/SADX-Truck/releases)
    and unzip it into SADX's `mods` folder, so you have `mods\SADX Truck\` with
-   `sadxtruck.dll`, `mod.ini`, `configschema.xml` and `setup.exe` in it.
+   `sadxtruck.dll`, `mod.ini`, `configschema.xml`, `setup.exe` and `sounds\crowd_panic.wav` in it.
 2. Put `cora3_enhancement_pack.zip` in that same folder (or anywhere; setup will ask for it).
 3. Double-click `setup.exe`. It looks for Cabela's 3 and Cabela's 1 in Program Files and asks
    for the folder when it cannot find one. When it is done it says so, and writes what it did
@@ -72,7 +72,19 @@ setup.exe "<Cabela's 3 folder>" "<Enhancement Pack zip>" ["<Cabela's 1 folder>"]
 | driving | left stick | steer |
 | driving | D-pad up | headlights on / off |
 | driving | D-pad down | traction: 2x4, 4x4, 4x4 Low |
+| driving | D-pad left / right | radio: OFF, Crush 40 Rock, Station Square FM, Action Stage, Chao Chill, Your Music |
 | driving | Y | get out |
+
+## Radio
+
+While driving, D-pad left / right changes the station; the station's name and the song show at the
+top for a few seconds. The stations play SADX's own soundtrack from your game folder
+(`system\sounddata\bgm\wma\`); Your Music plays any files you put in `mods\SADX Truck\radio\`
+(MP3, OGG, WAV or WMA). Stations keep going while you are away, so you tune back in mid-song.
+While the radio plays, the level's music waits. On foot, the radio is heard from the truck: full
+within 15 feet, fading out by 100 feet, where the level's music comes back. Turning the radio OFF
+brings the level's music back at once. The radio needs SA Mod Manager's "Enable BASS music" (on by
+default).
 
 ## Options
 
@@ -140,12 +152,16 @@ lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console sadxtruck/testho
 | Pillow's authors | the picture-resize code in `setup/textures.c` (see `THIRD_PARTY_NOTICES.md`) |
 | X-Hax (SA Mod Manager and the SADX Mod Loader) | the mod loader, and the SDK headers the mod's SADX addresses come from |
 | unshield | how InstallShield cabinets are laid out: `setup.exe` reads the Enhancement Pack's cabinet the way unshield 1.6.2 does |
+| freesound_community, on Pixabay | "crowdpanic", the crowd sound the Past's echidnas make when they see the truck (`sadxtruck/sounds/crowd_panic.wav`, a 12-second loop cut from it; Pixabay Content License) |
 
 ## License
 
 The mod's code is under the MIT License (see `LICENSE`), except the two adapted parts listed in
 `THIRD_PARTY_NOTICES.md`, which keep their own licenses. That covers only this repository's
 own code; Cabela's files that `setup.exe` reads or writes on your PC stay under their owners' terms.
+
+`sadxtruck/sounds/crowd_panic.wav` is not under the MIT License: it is under the Pixabay Content
+License (https://pixabay.com/service/license-summary/).
 
 Cabela's 4x4 Off-Road Adventure is a trademark of its owners. Sonic Adventure DX is a trademark of SEGA.
 This is a fan mod and is not affiliated with either.

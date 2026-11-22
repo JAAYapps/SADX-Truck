@@ -276,6 +276,9 @@ static int land_strength = 1;               // mod setting Damage / LandingStren
 static int truck_volume = 100;              // mod setting Sound / TruckVolume, 0 to 100
 static void damage_files_init(const char *path, unsigned n);
 static void free_cam_patch(void);
+static void people_patch(void);             // Past echidnas run from the truck
+static void radio_pick(int pick);           // radio: D-pad left / right while driving
+static int radio_text(const char **name, const char **title);
 static void sound_settings(const char *path, unsigned n);
 static void cart_pad_patch(void);
 static void missile_patch(void);
@@ -1851,6 +1854,7 @@ __declspec(dllexport) void __cdecl Init(const char *path, const void *helpers)
     damage_files_init(path, n);
     sound_settings(path, n);
     free_cam_patch();
+    people_patch();
     cart_pad_patch();
     missile_patch();
     while (*file) name[n++] = *file++;
@@ -2301,10 +2305,12 @@ static void btai_frame(void)
 //   IDirectSoundBuffer  9 GetStatus, 11 Lock, 12 Play, 13 SetCurrentPosition,
 //                       15 SetVolume, 17 SetFrequency, 18 Stop, 19 Unlock
 #define COM(obj, i, type) ((type)((*(void ***)(obj))[i]))
+#define PANIC_WAV TRUCK_WAVS                      // the Past's crowd sound (people_frame)
+#define SND_SLOTS (TRUCK_WAVS + 1)
 static void *ds;                                  // IDirectSound
-static void *wav_buf[TRUCK_WAVS];                 // IDirectSoundBuffer
-static u32 wav_rate[TRUCK_WAVS];                  // samples per second
-static char wav_failed[TRUCK_WAVS];
+static void *wav_buf[SND_SLOTS];                 // IDirectSoundBuffer
+static u32 wav_rate[SND_SLOTS];                  // samples per second
+static char wav_failed[SND_SLOTS];
 static int snd_state;                             // 0 not tried, 1 on, -1 off
 static unsigned char *snd_scratch;                // 4 MB for reading files
 #define SND_SCRATCH (4u << 20)
@@ -2358,7 +2364,7 @@ static int snd_load(int i)
     char path[400];
     u32 n = 0;
     for (const char *s = snd_dir; *s && n < 300; s++) path[n++] = *s;
-    for (const char *s = truck_wavs[i]; *s && n < 390; s++) path[n++] = *s;
+    for (const char *s = i == PANIC_WAV ? "crowd_panic.wav" : truck_wavs[i]; *s && n < 390; s++) path[n++] = *s;
     path[n] = 0;
     // 0x80000000 GENERIC_READ, 1 FILE_SHARE_READ, 3 OPEN_EXISTING
     void *h = k_CreateFileA(path, 0x80000000u, 1, 0, 3, 0, 0);
@@ -2399,7 +2405,7 @@ static int snd_load(int i)
 }
 
 static float snd_master = 0.8f;                 // see snd_set
-static unsigned char wav_vol_set[TRUCK_WAVS];   // snd_set gave it a volume
+static unsigned char wav_vol_set[SND_SLOTS];   // snd_set gave it a volume
 static void snd_play(int i, int loop)
 {
     if (!snd_load(i)) return;
@@ -2445,15 +2451,15 @@ static void snd_set(int i, float gain, float speed)
 // A level change is a pause too (game mode not 15) that never resumes
 // the old truck: engine_reset forgets the noted sounds (snd_pause_forget),
 // or the new truck's first frame played the old engine loop again.
-static unsigned char snd_was[TRUCK_WAVS];
+static unsigned char snd_was[SND_SLOTS];
 static void snd_pause_forget(void)
 {
-    for (int i = 0; i < TRUCK_WAVS; i++) snd_was[i] = 0;
+    for (int i = 0; i < SND_SLOTS; i++) snd_was[i] = 0;
 }
 static void snd_pause(int on)
 {
     unsigned char *was = snd_was;
-    for (int i = 0; i < TRUCK_WAVS; i++) {
+    for (int i = 0; i < SND_SLOTS; i++) {
         if (!wav_buf[i]) continue;
         if (on) {
             u32 st = 0;
@@ -3756,8 +3762,8 @@ static void draw_hud(void)
 // a mile.
 static void draw_gauges(void)
 {
-    static struct { short sx, sy, cx, cy, u1, v1, u2, v2, texid, attr; } anim[48];
-    static struct { float p[3], sx, sy; int ang; void *tlist, *tanim; } sprite[48];
+    static struct { short sx, sy, cx, cy, u1, v1, u2, v2, texid, attr; } anim[160];
+    static struct { float p[3], sx, sy; int ang; void *tlist, *tanim; } sprite[160];
     float scale = screen_h / 480.0f, right = screen_w - 640.0f * scale;
     int n = 0;
     // One sprite: texture (tw x th pixels) drawn over (x, y)-(x+w, y+h) in
@@ -3841,6 +3847,41 @@ static void draw_gauges(void)
                     n++;
                 }
                 x += (gl[4] + 2) * 0.6f;
+            }
+        }
+    }
+    // Radio banner: the station's name and the song, centered near the
+    // top, each letter drawn twice (a dark copy 1 unit down-right first).
+    {
+        const char *rl[2];
+        if (radio_text(&rl[0], &rl[1])) {
+            const float sz[2] = { 1.0f, 0.7f }, ly[2] = { 40.0f, 62.0f };
+            for (int q = 0; q < 2; q++) {
+                float w = 0;
+                for (const char *c = rl[q]; *c; c++)
+                    if (*c >= 32 && *c <= 126) w += (font_glyph[*c - 32][4] + 2) * sz[q];
+                for (int pass = 0; pass < 2; pass++) {
+                    float x = (screen_w / scale - w) * 0.5f, d = pass ? 0.0f : 1.0f;
+                    for (const char *c = rl[q]; *c && n < 160; c++) {
+                        if (*c < 32 || *c > 126) continue;
+                        const unsigned char *gl = font_glyph[*c - 32];
+                        if (gl[2] > gl[0]) {
+                            anim[n].sx = (short)(gl[2] - gl[0]); anim[n].sy = (short)(gl[3] - gl[1]);
+                            anim[n].cx = 0; anim[n].cy = 0;
+                            anim[n].u1 = gl[0]; anim[n].v1 = gl[1]; anim[n].u2 = gl[2]; anim[n].v2 = gl[3];
+                            anim[n].texid = TRUCK_TEX_FONT; anim[n].attr = 0;
+                            sprite[n].p[0] = (x + d) * scale; sprite[n].p[1] = (ly[q] + d) * scale; sprite[n].p[2] = 0;
+                            sprite[n].sx = sz[q] * scale; sprite[n].sy = sz[q] * 0.8f * scale;
+                            sprite[n].ang = 0;
+                            sprite[n].tlist = &truck_texlist; sprite[n].tanim = &anim[n];
+                            if (pass) SetMaterialAndSpriteColor_Float(1, 1, 1, 1);
+                            else SetMaterialAndSpriteColor_Float(1, 0, 0, 0);
+                            njDrawSprite2D_ForcePriority(&sprite[n], 0, -1.5f, (1u << 5) | (1u << 4) | (1u << 1));
+                            n++;
+                        }
+                        x += (gl[4] + 2) * sz[q];
+                    }
+                }
             }
         }
     }
@@ -6046,6 +6087,7 @@ static void on_frame(void)
             PrintDebug("[SADX Truck] %s repaired (all parts, battery 12.0 V, tank full)\n", trucks[picked].name);
         }
     } else repair_t = 0;
+    if (pick && riding) radio_pick(pick);
     if (pick && !riding) {
         picked = (picked + pick + TRUCKS) % TRUCKS;
         picture_frames = 120;                           // 2 seconds
@@ -6639,6 +6681,433 @@ static void free_cam_patch(void)
     PrintDebug("[SADX Truck] Twinkle Park free camera call patched\n");
 #endif
 }
+// The Past's walking echidnas, "O PEOPLE" (sonic.exe 0x543AF0, Past object
+// list).  Each one that walks a path has a "player near" callback at
+// awp + 40, 0x5430F0: the vanilla "stop and stand when the player comes
+// close".  The mod sends 0x5430F0 to people_near.
+// An ancient tribe that sees a truck panics: the truck (driven or parked)
+// within 150 feet of any walker -> every walker in the city runs, state 2
+// (walk) with the path walker's speed (awp + 44 -> + 16, vanilla 0.5) at
+// 1.5, which plays the walk motion 3 times as fast and moves 3 times as
+// far each frame.  The panic lasts until no walker has seen the truck for
+// 10 seconds.  While it lasts, sounds\crowd_panic.wav loops (if present;
+// the mod ships no such file).
+// Otherwise the vanilla code runs, from its first 8 bytes copied out
+// (mov ecx,[esp+4] / sub esp,12 / push esi) and a jump back to 0x5430F8.
+#define PEOPLE_LEVEL 34                    // LevelIDs_Past
+#define PEOPLE_SIGHT2 (457.0f * 457.0f)    // 150 feet, in SADX units, squared
+#define PEOPLE_CALM_FRAMES 600             // 10 seconds
+#define PEOPLE_RUN 1.5f
+#define PEOPLE_WALK 0.5f
+typedef int (__cdecl *people_fn)(char *tp);
+static unsigned char *people_vanilla;      // the copied 8 bytes + jmp 0x5430F8
+static float people_truck[3];              // the truck, SADX units
+static int people_truck_here;              // the truck is in the Past this frame
+static int people_seen;                    // a walker saw the truck this frame
+static int people_panic;                   // frames of panic left
+static int people_count;                   // walkers running this frame
+static int people_running;                 // the most running at once in this panic
+
+static int __cdecl people_near(char *tp)
+{
+    char *twp = *(char **)(tp + 32), *awp = *(char **)(tp + 44);
+    char *walk = awp ? *(char **)(awp + 44) : 0;
+    if (twp && walk) {
+        const float *p = (const float *)(twp + 32);
+        float *speed = (float *)(walk + 16);
+        int *state = (int *)awp;
+        if (people_truck_here) {
+            float dx = p[0] - people_truck[0], dz = p[2] - people_truck[2];
+            if (dx * dx + dz * dz < PEOPLE_SIGHT2) people_seen = 1;
+        }
+        if (people_panic && state[0] != 1 && state[0] != 3) {   // 1 and 3: vanilla leaves those alone too
+            *speed = PEOPLE_RUN;
+            if (state[0] != 2 && state[1] != 2) {           // blend into walk, like vanilla 0x5431AA
+                state[1] = 2;
+                *(float *)(awp + 28) = *(float *)(twp + 8);
+                *(float *)(awp + 32) = 1.0f / 12.0f;
+                *(float *)(twp + 8) = 0.0f;
+            }
+            people_count++;
+            return 0;                                       // 0: no "look at the player"
+        }
+        if (*speed == PEOPLE_RUN) *speed = PEOPLE_WALK;
+    }
+    return ((people_fn)people_vanilla)(tp);
+}
+
+// OnFrame: where the truck is, and the panic's start and end.
+static void people_frame(void)
+{
+#ifndef TEST_EXE
+    int was = people_panic;
+    if (people_count > people_running) people_running = people_count;
+    people_count = 0;
+    if (people_seen) people_panic = PEOPLE_CALM_FRAMES;
+    else if (people_panic) people_panic--;
+    if (level_now != PEOPLE_LEVEL) people_panic = 0;
+    if (people_panic && !was) {
+        PrintDebug("[SADX Truck] Past: the tribe saw the truck, panic\n");
+        snd_play(PANIC_WAV, 1);
+        snd_set(PANIC_WAV, 70.0f, 1.0f);
+    }
+    if (!people_panic && was) {
+        PrintDebug("[SADX Truck] Past: echidnas calm again (%d were running)\n", people_running);
+        snd_stop(PANIC_WAV);
+    }
+    people_seen = 0;
+    if (!people_panic) people_running = 0;     // while it lasts: the most seen running at once
+    people_truck_here = 0;
+    if (!people_vanilla || !truck || !frame || level_now != PEOPLE_LEVEL) return;
+    const char *body = *(const char *const *)((const char *)truck + 4);
+    const float *pos = (const float *)(body + 0x28);
+    people_truck[0] = origin.x + pos[0] * UNITS_PER_METER;
+    people_truck[1] = origin.y + pos[1] * UNITS_PER_METER;
+    people_truck[2] = origin.z + pos[2] * UNITS_PER_METER;
+    people_truck_here = 1;
+#endif
+}
+
+// Radio, driving only: D-pad left / right picks the station (OFF, then
+// the stations below).  SADX's own songs (MusicList, sonic.exe 0x910298,
+// files in system\sounddata\bgm\wma\) and Your Music (any files in the
+// mod folder's radio\).  The mod plays them on its own BASS channel:
+// bass.dll and bass_vgmstream.dll are the Mod Loader's (extlib\BASS),
+// loaded by it when "Enable BASS music" is on.  The Mod Loader opens a
+// song with BASS_VGMSTREAM_StreamCreate (path, flags), cdecl, and when
+// that fails BASS_StreamCreateFile; music volume (MusicVolume 0x909F28 +
+// 10000) / 30000 (SADXModLoader.dll 0x10095F30).  The radio does the same.
+// While it can be heard, the level's music is paused: PauseMusic 0x40D060
+// and ResumeMusic 0x40D0A0, which the Mod Loader sends to its own
+// (SADXModLoader.dll 0x100961F0 / 0x10096250).  Those count: each pause
+// adds 1, each resume takes 1 off and resumes at 0 (they also pause and
+// resume voices).  So the radio pauses once, and once more each time the
+// game starts a new song (CurrentSong 0x912698), and gives back exactly
+// as many resumes.  On foot the radio is heard from the truck: full
+// within 15 feet, fading to nothing at 100 feet, where the level's music
+// comes back.
+// Stations keep "playing" while nobody listens: a clock runs while the
+// game runs, and tuning in skips ahead by the time since the song began.
+#define RADIO_MAX_SONGS 64
+struct radio_song { const char *file, *title; };
+struct radio_station {
+    const char *name;
+    struct radio_song song[RADIO_MAX_SONGS];
+    int n;
+    int order[RADIO_MAX_SONGS], at, started;   // shuffled play order, the song now
+    float began;                               // radio clock when the song now began
+};
+#define BGM(f, t) { "system\\sounddata\\bgm\\wma\\" f ".wma", t }
+static struct radio_station radio_st[] = {
+    { "CRUSH 40 ROCK", { BGM("mainthem", "Open Your Heart"), BGM("thesonic", "It Doesn't Matter"),
+                         BGM("themiles", "Believe in Myself"), BGM("theknkls", "Unknown from M.E."),
+                         BGM("theamy", "My Sweet Passion"), BGM("thebig", "Lazy Days"),
+                         BGM("thee102", "E-102 Gamma") }, 7 },
+    { "STATION SQUARE FM", { BGM("s_square", "Station Square"), BGM("mstcln", "Mystic Ruins"),
+                             BGM("egcarer1", "Egg Carrier 1"), BGM("egcarer2", "Egg Carrier 2"),
+                             BGM("casino1", "Casinopolis 1"), BGM("casino2", "Casinopolis 2") }, 6 },
+    { "ACTION STAGE", { BGM("ecoast1", "Emerald Coast"), BGM("wndyvly1", "Windy Valley"),
+                        BGM("twnklpk1", "Twinkle Park"), BGM("highway1", "Speed Highway"),
+                        BGM("redmntn1", "Red Mountain"), BGM("skydeck1", "Sky Deck"),
+                        BGM("icecap1", "Ice Cap"), BGM("lstwrld1", "Lost World"),
+                        BGM("finaleg1", "Final Egg"), BGM("sandhill", "Sand Hill"),
+                        BGM("circuit", "Twinkle Circuit") }, 11 },
+    { "CHAO CHILL", { BGM("chao", "Chao Garden"), BGM("chaohall", "chaohall"), BGM("chaorace", "Chao Race"),
+                      BGM("chao_g_iede", "chao_g_iede"), BGM("chao_k_m", "chao_k_m") }, 5 },
+    { "YOUR MUSIC", { { 0, 0 } }, 0 },          // filled from the radio\ folder
+};
+#undef BGM
+#define RADIO_N (int)(sizeof radio_st / sizeof radio_st[0])
+#define RADIO_YOURS (RADIO_N - 1)
+static int radio_on;                           // 0 OFF, else station radio_on - 1
+static int radio_state;                        // 0 not tried, 1 ready, -1 no BASS
+static u32 radio_h;                            // the BASS channel playing, 0 none
+static int radio_paused;                       // radio_h paused for the pause menu
+static int radio_music_pauses;                 // PauseMusic calls the radio has not given back
+static int radio_seen_song;                    // CurrentSong when the radio last paused
+static float radio_clock;                      // seconds the game has run
+static int radio_banner;                       // frames the banner still shows
+static int radio_dead;                         // the station picked has nothing that opens
+static const char *radio_now_title;
+static u32 radio_rand = 12345;
+static char radio_names[RADIO_MAX_SONGS][64];  // Your Music: paths
+static char radio_titles[RADIO_MAX_SONGS][40]; // and titles
+typedef unsigned long long u64;
+static u32 (__cdecl *vg_create)(const char *, u32);
+static u32 (__stdcall *bs_create)(int, const void *, u64, u64, u32);
+static int (__stdcall *bs_play)(u32, int);
+static int (__stdcall *bs_pause)(u32);
+static int (__stdcall *bs_free)(u32);
+static int (__stdcall *bs_attr)(u32, u32, float);
+static u32 (__stdcall *bs_active)(u32);
+static u64 (__stdcall *bs_len)(u32, u32);
+static int (__stdcall *bs_setpos)(u32, u64, u32);
+static double (__stdcall *bs_b2s)(u32, u64);
+static u64 (__stdcall *bs_s2b)(u32, double);
+
+static u32 radio_rnd(void) { radio_rand = radio_rand * 1103515245u + 12345u; return radio_rand >> 8; }
+
+// Your Music: every file in the mod folder's radio\ (snd_dir is
+// "<mod>\sounds\"); BASS or vgmstream decide what they can play.
+static void radio_scan(void)
+{
+    void *k = LoadLibraryExA("kernel32.dll", 0, 0);
+    void *(__stdcall *ff)(const char *, void *) = (void *)GetProcAddress(k, "FindFirstFileA");
+    int (__stdcall *fn)(void *, void *) = (void *)GetProcAddress(k, "FindNextFileA");
+    int (__stdcall *fc)(void *) = (void *)GetProcAddress(k, "FindClose");
+    char dir[340], pat[350];
+    u32 n = 0;
+    for (const char *s = snd_dir; *s && n < 300; s++) dir[n++] = *s;
+    if (n >= 7) n -= 7;                        // "sounds\" off
+    for (const char *s = "radio\\"; *s; s++) dir[n++] = *s;
+    dir[n] = 0;
+    for (u32 i = 0; i <= n; i++) pat[i] = dir[i];
+    pat[n] = '*'; pat[n + 1] = 0;
+    struct radio_station *st = &radio_st[RADIO_YOURS];
+    unsigned char fd[320];                     // WIN32_FIND_DATAA: attributes at 0, name at 44
+    void *h = ff ? ff(pat, fd) : (void *)-1;
+    if (h == (void *)-1) { PrintDebug("[SADX Truck] radio: no %s folder, Your Music is empty\n", dir); return; }
+    do {
+        const char *nm = (const char *)fd + 44;
+        if (*(u32 *)fd & (1u << 4)) continue;  // a folder
+        u32 a = 0, b = 0, dot = 0;
+        for (; dir[a] && a < 63; a++) radio_names[st->n][a] = dir[a];
+        for (const char *s = nm; *s && a < 63; s++) radio_names[st->n][a++] = *s;
+        radio_names[st->n][a] = 0;
+        if (a >= 63) continue;                 // path too long
+        for (const char *s = nm; *s && b < 39; s++, b++) { radio_titles[st->n][b] = *s; if (*s == '.') dot = b; }
+        radio_titles[st->n][dot ? dot : b] = 0;
+        st->song[st->n].file = radio_names[st->n];
+        st->song[st->n].title = radio_titles[st->n];
+        st->n++;
+    } while (st->n < RADIO_MAX_SONGS && fn(h, fd));
+    fc(h);
+    PrintDebug("[SADX Truck] radio: Your Music has %d file(s) in %s\n", st->n, dir);
+}
+
+static void radio_init(void)
+{
+    if (radio_state) return;
+    radio_state = -1;
+    void *k = LoadLibraryExA("kernel32.dll", 0, 0);
+    void *(__stdcall *gmh)(const char *) = (void *)GetProcAddress(k, "GetModuleHandleA");
+    u32 (__stdcall *tick)(void) = (void *)GetProcAddress(k, "GetTickCount");
+    void *b = gmh ? gmh("bass.dll") : 0, *v = gmh ? gmh("bass_vgmstream.dll") : 0;
+    if (!b) { PrintDebug("[SADX Truck] radio off: bass.dll not loaded (SA Mod Manager: turn on \"Enable BASS music\")\n"); return; }
+    vg_create = v ? (void *)GetProcAddress(v, "BASS_VGMSTREAM_StreamCreate") : 0;
+    bs_create = (void *)GetProcAddress(b, "BASS_StreamCreateFile");
+    bs_play = (void *)GetProcAddress(b, "BASS_ChannelPlay");
+    bs_pause = (void *)GetProcAddress(b, "BASS_ChannelPause");
+    bs_free = (void *)GetProcAddress(b, "BASS_StreamFree");
+    bs_attr = (void *)GetProcAddress(b, "BASS_ChannelSetAttribute");
+    bs_active = (void *)GetProcAddress(b, "BASS_ChannelIsActive");
+    bs_len = (void *)GetProcAddress(b, "BASS_ChannelGetLength");
+    bs_setpos = (void *)GetProcAddress(b, "BASS_ChannelSetPosition");
+    bs_b2s = (void *)GetProcAddress(b, "BASS_ChannelBytes2Seconds");
+    bs_s2b = (void *)GetProcAddress(b, "BASS_ChannelSeconds2Bytes");
+    if (!bs_create || !bs_play || !bs_pause || !bs_free || !bs_attr || !bs_active || !bs_len ||
+        !bs_setpos || !bs_b2s || !bs_s2b) { PrintDebug("[SADX Truck] radio off: bass.dll is missing a function\n"); return; }
+    radio_rand = tick ? tick() : 12345u;
+    radio_scan();
+    for (int s = 0; s < RADIO_N; s++) {        // shuffle each station's order
+        struct radio_station *st = &radio_st[s];
+        for (int i = 0; i < st->n; i++) st->order[i] = i;
+        for (int i = st->n - 1; i > 0; i--) {
+            int j = (int)(radio_rnd() % (u32)(i + 1)), t = st->order[i];
+            st->order[i] = st->order[j]; st->order[j] = t;
+        }
+    }
+    radio_state = 1;
+    PrintDebug("[SADX Truck] radio ready (BASS%s)\n", vg_create ? " + vgmstream" : ", no vgmstream: SADX's WMA songs will not open");
+}
+
+// Open one song, paused at its start.  A mod that replaces the file
+// (GetReplaceablePath, HelperFunctions slot 17) is followed, like SADX's music.
+static u32 radio_open(const char *file, float *len)
+{
+#ifndef TEST_EXE
+    const char *(__cdecl *rp)(const char *) = map_helpers ? *(void **)((const char *)map_helpers + 68) : 0;
+#else
+    const char *(__cdecl *rp)(const char *) = 0;
+#endif
+    const char *p = rp ? rp(file) : file;
+    // Plain BASS first: it knows the length (WMA through Windows' own
+    // codecs, MP3, OGG, WAV).  Then vgmstream (ADX and other game formats),
+    // whose length reads as unknown (-1): *len 0, played from its start.
+    u32 h = bs_create(0, p, 0, 0, 0);
+    if (!h && vg_create) h = vg_create(p, 0);
+    if (!h) return 0;
+    u64 n = bs_len(h, 0);
+    *len = n == (u64)-1 ? 0.0f : (float)bs_b2s(h, n);
+    if (*len > 36000.0f) *len = 0.0f;           // over 10 hours: unknown too
+    return h;
+}
+
+// Tune in: the station's song now, at the spot it has reached.
+static void radio_tune(void)
+{
+    struct radio_station *st = &radio_st[radio_on - 1];
+    if (!st->n) { PrintDebug("[SADX Truck] radio: %s has no songs\n", st->name); radio_dead = 1; return; }
+    int fails = 0;
+    for (int tries = 0; tries < 40; tries++) {
+        const struct radio_song *sg = &st->song[st->order[st->at]];
+        float len;
+        u32 h = radio_open(sg->file, &len);
+        if (!h) {
+            PrintDebug("[SADX Truck] radio: could not open %s, skipped\n", sg->file);
+            st->at = (st->at + 1) % st->n;
+            st->began = radio_clock;
+            if (++fails >= st->n) {                // nothing on this station opens
+                radio_dead = 1;
+                PrintDebug("[SADX Truck] radio: nothing on %s opens; pick it again to retry\n", st->name);
+                return;
+            }
+            continue;
+        }
+        if (len < 1.0f) {                      // length unknown: from its start
+            st->began = radio_clock;
+            st->started = 1;
+            len = 0;
+        }
+        if (!st->started) {                    // first time: as if it had been on a while
+            st->at = (int)(radio_rnd() % (u32)st->n);
+            st->began = radio_clock - (float)(radio_rnd() % 1000u) / 1000.0f * len * 0.8f;
+            st->started = 1;
+            bs_free(h);
+            continue;
+        }
+        float off = radio_clock - st->began;
+        if (off < 0 || !len) off = 0;
+        if (len && off > len - 1.0f) {                // that song ended while nobody listened
+            bs_free(h);
+            st->began += len;
+            st->at = (st->at + 1) % st->n;
+            if (tries == 39) st->began = radio_clock;
+            continue;
+        }
+        if (off > 0.5f) bs_setpos(h, bs_s2b(h, (double)off), 0);
+        bs_attr(h, 2, (float)(*(const int *)0x909F28 + 10000) / 30000.0f);
+        bs_play(h, 0);
+        radio_h = h;
+        radio_paused = 0;
+        radio_now_title = sg->title;
+        PrintDebug("[SADX Truck] radio: %s, %s (from %.0f s of %.0f)\n", st->name, sg->title, (double)off, (double)len);
+        return;
+    }
+}
+
+// hold 1: the level's music stays paused (a new song paused too); 0: back.
+static void radio_level_music(int hold)
+{
+    if (hold) {
+        int song = *(const int *)0x912698;
+        if (!radio_music_pauses || song != radio_seen_song) {
+            ((void (*)(void))0x40D060)();      // PauseMusic
+            radio_music_pauses++;
+            radio_seen_song = song;
+        }
+    } else {
+        while (radio_music_pauses > 0) {
+            ((void (*)(void))0x40D0A0)();      // ResumeMusic
+            radio_music_pauses--;
+        }
+    }
+}
+
+static void radio_stop(void)
+{
+    if (radio_h) { bs_free(radio_h); radio_h = 0; }
+    radio_paused = 0;
+    radio_level_music(0);
+}
+
+// From on_frame's input: D-pad left (-1) / right (+1) while driving.
+static void radio_pick(int pick)
+{
+    radio_init();
+    if (radio_state != 1) return;
+    radio_on = (radio_on + pick + RADIO_N + 1) % (RADIO_N + 1);
+    if (radio_h) { bs_free(radio_h); radio_h = 0; }
+    radio_dead = 0;
+    radio_now_title = 0;
+    radio_banner = 150;
+    PrintDebug("[SADX Truck] radio: %s\n", radio_on ? radio_st[radio_on - 1].name : "OFF");
+}
+
+// The banner's two lines, for draw_gauges; 0 when none.
+static int radio_text(const char **name, const char **title)
+{
+    if (radio_banner <= 0) return 0;
+    *name = radio_on ? radio_st[radio_on - 1].name : "RADIO OFF";
+    *title = radio_now_title ? radio_now_title : "";
+    return 1;
+}
+
+// OnFrame.
+static void radio_frame(void)
+{
+    int playing = game_mode == 15;
+    if (playing) radio_clock += 1.0f / 60.0f;
+    if (radio_banner > 0 && playing) radio_banner--;
+    if (radio_state != 1) return;
+    if (!radio_on || !frame || !truck) { radio_stop(); return; }
+    if (!playing) {                            // pause menu: the radio waits
+        if (radio_h && !radio_paused) { bs_pause(radio_h); radio_paused = 1; }
+        return;
+    }
+    if (!radio_h) { if (!radio_dead) radio_tune(); }
+    else if (radio_paused) { bs_play(radio_h, 0); radio_paused = 0; }
+    else if (bs_active(radio_h) == 0) {        // the song ended: the next one
+        struct radio_station *st = &radio_st[radio_on - 1];
+        bs_free(radio_h); radio_h = 0;
+        st->at = (st->at + 1) % st->n;
+        st->began = radio_clock;
+        radio_tune();
+        radio_banner = 150;
+    }
+    if (!radio_h) return;
+    // On foot: how loud the truck's radio is where Sonic stands.
+    float k = 1.0f;
+    if (!riding) {
+        k = 0.0f;
+        if (player_task) {
+            const char *body = *(const char *const *)((const char *)truck + 4);
+            const float *tp = (const float *)(body + 0x28), *pp = (const float *)(player_task + 32);
+            float dx = pp[0] - (origin.x + tp[0] * UNITS_PER_METER);
+            float dy = pp[1] - (origin.y + tp[1] * UNITS_PER_METER);
+            float dz = pp[2] - (origin.z + tp[2] * UNITS_PER_METER);
+            float ft = sqrt_f(dx * dx + dy * dy + dz * dz) / UNITS_PER_METER * 3.281f;
+            k = ft <= 15.0f ? 1.0f : ft >= 100.0f ? 0.0f : (100.0f - ft) / 85.0f;
+        }
+    }
+    bs_attr(radio_h, 2, k * (float)(*(const int *)0x909F28 + 10000) / 30000.0f);
+    radio_level_music(k > 0.0f);
+}
+
+static void people_patch(void)
+{
+#ifndef TEST_EXE
+    static const unsigned char want[8] = { 0x8B, 0x4C, 0x24, 0x04, 0x83, 0xEC, 0x0C, 0x56 };
+    unsigned char *p = (unsigned char *)0x5430F0;
+    u32 old;
+    for (int i = 0; i < 8; i++)
+        if (p[i] != want[i]) {
+            PrintDebug("[SADX Truck] Past echidna callback at 0x5430F0: unexpected bytes, not patched\n");
+            return;
+        }
+    unsigned char *t = VirtualAlloc(0, 16, 0x3000, 0x40);   // commit + reserve, read/write/run
+    if (!t) return;
+    for (int i = 0; i < 8; i++) t[i] = p[i];
+    u32 back = 0x5430F8u - ((u32)t + 13);
+    t[8] = 0xE9; t[9] = back & 255; t[10] = (back >> 8) & 255; t[11] = (back >> 16) & 255; t[12] = back >> 24;
+    people_vanilla = t;
+    u32 rel = (u32)people_near - (0x5430F0u + 5);
+    VirtualProtect(p, 5, 0x40, &old);
+    p[0] = 0xE9; p[1] = rel & 255; p[2] = (rel >> 8) & 255; p[3] = (rel >> 16) & 255; p[4] = rel >> 24;
+    VirtualProtect(p, 5, old, &old);
+    PrintDebug("[SADX Truck] Past echidna callback patched\n");
+#endif
+}
 // Twinkle Park's cart pads, "O DASH PANEL 4 CART" and "O JUMP PANEL 4
 // CART" (object names from sonic.exe's object list).  When something hits
 // one, its hit code (dash 0x79D370, jump 0x79D6F0) works out the push, in
@@ -6709,6 +7178,8 @@ __declspec(dllexport) void __cdecl OnFrame(void)
     on_frame();
     cart_cam_feed();
     free_cam_release();
+    people_frame();
+    radio_frame();
     solid_place(truck && frame && !riding);
 }
 
