@@ -2121,6 +2121,14 @@ static int btai_loaded(void)
     }
     return known;
 }
+__declspec(dllexport) int __cdecl TruckCharacterDriving(void)
+{
+    return riding;
+}
+__declspec(dllexport) int __cdecl TruckTailsRiding(void)
+{
+    return riding && tails_riding;
+}
 #define RUN_OVER_MPS 6.7f       // 15 mph
 static int run_over, run_check; // Sonic's shape 0 set for running enemies over
 static unsigned char run_damage;
