@@ -2129,6 +2129,13 @@ __declspec(dllexport) int __cdecl TruckTailsRiding(void)
 {
     return riding && tails_riding;
 }
+// Exports of truck state
+static int hit_count, last_hit_mph, speed_mph_now;
+__declspec(dllexport) int __cdecl TruckSpeedMph(void)    { return riding ? speed_mph_now : 0; }        // updated once a second
+__declspec(dllexport) int __cdecl TruckAirTenths(void)   { return riding ? (int)(air_t * 10.0f) : 0; } // 15 = 1.5 seconds in the air
+__declspec(dllexport) int __cdecl TruckFuelPercent(void) { return (int)(fuel[truck_now] * 100.0f); }
+__declspec(dllexport) int __cdecl TruckHitCount(void)    { return hit_count; }                         // goes up by 1 on every counted hit
+__declspec(dllexport) int __cdecl TruckLastHitMph(void)  { return last_hit_mph; }
 #define RUN_OVER_MPS 6.7f       // 15 mph
 static int run_over, run_check; // Sonic's shape 0 set for running enemies over
 static unsigned char run_damage;
@@ -3491,6 +3498,8 @@ static void detect_hits(float dt)
     static float dent_mult = 1.0f;
     dent_mult = hit_cool > 0 ? dent_mult + 0.1f : 1.0f;
     hit_cool = 0.75f;
+    hit_count++;
+    last_hit_mph = (int)(speed * 2.23694f);   // m per second -> mph
     last_hit_speed = speed;
     // The surface's facing in truck space (Cabela's: normal y above 0.95 =
     // from below, x 0.02; below -0.3 = on the roof, x 2.5).
@@ -6447,6 +6456,7 @@ static void on_frame(void)
         truck_center(c);
         float dx = c[0] - last_center[0], dz = c[2] - last_center[2];
         float mph = sqrt_f(dx * dx + dz * dz) * 2.23694f;   // m per second -> mph
+        speed_mph_now = (int)mph;
         last_center[0] = c[0]; last_center[1] = c[1]; last_center[2] = c[2];
         PrintDebug("[SADX Truck] second %3d  gas %.2f  brake %.2f  steer %+.2f  %5.1f mph  RPM %6.1f  gear %d  engine %s  battery %.1f V  engine %.0f/%.0f (level %d)  water %s%.2f m\n",
                    frame / 60, (double)gas, (double)brake, (double)steer, (double)mph,
